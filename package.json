@@ -1,9 +1,20 @@
 {
   "name": "easy-spec-mcp",
-  "version": "1.0.0",
-  "private": true,
-  "description": "MCP server for Easy Spec - Playwright -- a thin relay that forwards every operation over the bridge to a connected side panel; it never reads project files or drives a browser itself.",
+  "version": "1.0.1",
+  "description": "MCP server for Easy Spec - Playwright: edit flows, scenarios, and page objects, and drive live browser automation, through a connected browser extension side panel.",
   "main": "server.js",
+  "bin": {
+    "easy-spec-mcp": "./server.js"
+  },
+  "files": [
+    "server.js",
+    "bridge.js"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Yan-Vi/easy-spec-mcp.git"
+  },
   "scripts": {
     "start": "node server.js"
   },
