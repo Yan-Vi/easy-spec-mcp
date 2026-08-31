@@ -46,8 +46,11 @@ function buildBridgeApi(wss, port) {
   function projectLeafName(projectDir) {
     return path.basename(path.resolve(projectDir));
   }
+  // projectDir is null for a panel with no project connected at all (see sidepanel.js's
+  // sendBridgeHello) -- passing null through finds exactly those sessions instead of every named
+  // one, the same way client.projectName itself is null until a folder's actually connected.
   function findPanelsFor(projectDir) {
-    const leaf = projectLeafName(projectDir);
+    const leaf = projectDir ? projectLeafName(projectDir) : null;
     return [...sidepanels].filter((c) => c.projectName === leaf);
   }
 
@@ -118,10 +121,11 @@ function buildBridgeApi(wss, port) {
       }
       targets = named; // sessionName is unique per connection (see sidepanel.js's SESSION_NAME), so this is always exactly one
     }
-    if (!targets.length) throw new Error('No side panel connected for this project -- open the side panel and connect this folder first.');
+    const scope = projectDir ? 'for this project' : 'with no project connected';
+    if (!targets.length) throw new Error(`No side panel connected ${scope} -- open the side panel${projectDir ? ' and connect this folder' : ''} first.`);
     if (targets.length > 1) {
       const names = targets.map((t) => t.sessionName || '(unnamed)').join(', ');
-      throw new Error(`More than one side panel is connected to this project (${names}) -- pass \`session\` to say which one, or close all but one and try again.`);
+      throw new Error(`More than one side panel is connected ${scope} (${names}) -- pass \`session\` to say which one, or close all but one and try again.`);
     }
     const requestId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
     return new Promise((resolve, reject) => {

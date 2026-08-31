@@ -113,16 +113,20 @@ function resolveLiveProject(project, session) {
       const available = bridge.connectedSessions().map((s) => s.sessionName || '(unnamed)').join(', ') || '(none connected)';
       throw new Error(`No side panel named "${session}" is connected. Connected: ${available}`);
     }
-    return match.projectName;
+    return match.projectName; // may be null -- that session has no project connected, which is fine for the live_* tools
   }
   if (project) return project;
   if (process.env.EASYSPEC_PROJECT) return process.env.EASYSPEC_PROJECT;
-  const connected = bridge.connectedProjectNames();
-  if (connected.length === 1) return connected[0];
-  if (connected.length > 1) {
-    throw new Error(`Multiple side panels are connected (${connected.join(', ')}) -- pass \`project\` or \`session\` to say which one.`);
+  // Unlike resolveCore's soleConnectedName (file-based tools genuinely need a project to read/
+  // write), a live_* call is happy to auto-target the one connected side panel even if it has no
+  // project open at all -- driving tabs/snapshot/pick-element/ad-hoc steps needs no project.
+  const sessions = bridge.connectedSessions();
+  if (sessions.length === 1) return sessions[0].projectName;
+  if (sessions.length > 1) {
+    const names = sessions.map((s) => s.sessionName || '(unnamed)').join(', ');
+    throw new Error(`Multiple side panels are connected (${names}) -- pass \`project\` or \`session\` to say which one.`);
   }
-  throw new Error('No project specified, EASYSPEC_PROJECT is not set, and no side panel is connected -- pass `project`, set EASYSPEC_PROJECT, or open the extension and connect a folder (check with live_status).');
+  throw new Error('No side panel is connected -- pass `project`/`session`, set EASYSPEC_PROJECT, or open the extension (check with live_status).');
 }
 
 function jsonResult(value) {
