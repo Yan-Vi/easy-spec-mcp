@@ -960,6 +960,12 @@ async function main() {
   console.error(`[playwright-easy-spec] Agent name: ${bridge.agentName} -- approve this exact name in the side panel to let it control the browser.`);
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  // StdioServerTransport never watches stdin for EOF (see its own start() -- only 'data'/'error'),
+  // and bridge's WebSocketServer is a persistent listening handle, so once the MCP client that
+  // spawned this process exits and its end of the stdio pipe closes, nothing here notices and the
+  // process lingers forever on that socket. Exit explicitly instead of relying on the event loop
+  // to drain on its own.
+  process.stdin.on('close', () => process.exit(0));
 }
 
 main().catch((err) => {
