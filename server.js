@@ -150,7 +150,7 @@ function safe(handler) {
   };
 }
 
-const server = new McpServer({ name: 'playwright-easy-spec', version: '1.0.0' });
+const server = new McpServer({ name: 'playwright-easy-spec', version: '1.1.0' });
 
 // ---------- inspection ----------
 
@@ -193,7 +193,7 @@ server.registerTool(
     const out = [];
     for (const name of names) {
       const po = await core.loadPageObject(name);
-      out.push({ name, folder: po.folder || '', locators: Object.keys(po.methods || {}).length });
+      out.push({ name, folder: po.folder || '', locators: Object.keys(po.methods || {}).length, scopes: Object.keys(po.scopes || {}).length });
     }
     return jsonResult(out);
   })
@@ -220,17 +220,31 @@ server.registerTool(
 server.registerTool(
   'get_page_object',
   {
-    description: 'Get a page object\'s locators. Each locator shows its inferred parameters (from ${...} in its selector, see extractPoParams) alongside the raw selector.',
+    description:
+      'Get a page object\'s locators and scopes. `selector` is a Playwright locator-chain EXPRESSION -- the ' +
+      'text that goes after "page." (or the scope\'s own expression, for a scoped one), e.g. ' +
+      '"getByRole(\'button\', { name: \'Submit\' })" or "locator(\'#submit\')" -- never a bare selector-engine ' +
+      'string on its own. Each shows its inferred parameters (from ${...} inside one of the expression\'s ' +
+      'own string-literal arguments, see extractPoParams) alongside the raw expression. A locator with a ' +
+      '`scope` field is nested under that named scope (see the scopes map) -- its own expression only needs ' +
+      'to be unique within the scope\'s subtree, not the whole page.',
     inputSchema: { ...projectArg, name: z.string() },
   },
   safe(async ({ project, name }) => {
     const core = await resolveCore(project);
     const po = await core.loadPageObject(name);
     if (!po) throw new Error(`Page object "${name}" not found.`);
+    const methodScopes = po.methodScopes || {};
     const locators = Object.fromEntries(
-      Object.entries(po.methods || {}).map(([method, selector]) => [method, { selector, params: extractPoParams(selector).params }])
+      Object.entries(po.methods || {}).map(([method, selector]) => [
+        method,
+        { selector, params: extractPoParams(selector).params, scope: methodScopes[method] || null },
+      ])
     );
-    return jsonResult({ name: po.name, folder: po.folder || '', locators });
+    const scopes = Object.fromEntries(
+      Object.entries(po.scopes || {}).map(([scopeName, selector]) => [scopeName, { selector, params: extractPoParams(selector).params }])
+    );
+    return jsonResult({ name: po.name, folder: po.folder || '', locators, scopes });
   })
 );
 
@@ -240,7 +254,15 @@ server.registerTool(
   'create_flow',
   {
     description: 'Create a new, empty flow.',
-    inputSchema: { ...projectArg, name: z.string(), id: z.string().optional(), folder: z.string().optional(), description: z.string().optional() },
+    inputSchema: {
+      ...projectArg,
+      name: z.string(),
+      id: z.string().optional(),
+      folder: z.string().optional(),
+      description: z.string().optional(),
+      preconditions: z.string().optional().describe('Setup/state assumed to already hold before this flow runs.'),
+      notes: z.string().optional().describe('Caveats or instructions for anyone editing this flow.'),
+    },
   },
   safe(async ({ project, ...rest }) => jsonResult(await (await resolveCore(project)).createFlow(rest)))
 );
@@ -257,8 +279,16 @@ server.registerTool(
 server.registerTool(
   'set_flow_meta',
   {
-    description: 'Update a flow\'s name, folder, and/or description.',
-    inputSchema: { ...projectArg, flowId: z.string(), name: z.string().optional(), folder: z.string().optional(), description: z.string().optional() },
+    description: 'Update a flow\'s name, folder, description, preconditions, and/or notes.',
+    inputSchema: {
+      ...projectArg,
+      flowId: z.string(),
+      name: z.string().optional(),
+      folder: z.string().optional(),
+      description: z.string().optional(),
+      preconditions: z.string().optional(),
+      notes: z.string().optional(),
+    },
   },
   safe(async ({ project, flowId, ...patch }) => jsonResult(await (await resolveCore(project)).setFlowMeta(flowId, patch)))
 );
@@ -270,9 +300,16 @@ server.registerTool(
 // entirely on `kind` (this mirrors how the step editor's own form shows/hides fields by kind).
 const stepSchema = z.object({}).passthrough().describe(
   'A step object: { kind, method, selector?, pageObjectName?, pageObjectMethod?, pageObjectArgs?, ' +
-  'elementAlias?, args?, options?, negate?, variable?, condition?, init?, update?, steps?, ' +
-  'iterableName?, itemVarName? } -- same shape as a flow.json step; see get_flow on an existing ' +
-  'flow for real examples of each kind.'
+  'elementAlias?, scopeName?, scopeSelector?, args?, options?, negate?, variable?, condition?, init?, ' +
+  'update?, steps?, iterableName?, itemVarName? } -- same shape as a flow.json step; see get_flow on an ' +
+  'existing flow for real examples of each kind. `selector`/`scopeSelector` are Playwright locator-chain ' +
+  'EXPRESSIONS (see get_page_object\'s own description), not bare selector-engine strings -- e.g. ' +
+  '"getByRole(\'button\', { name: \'Submit\' })", spliced as page.<selector> (or <scope>.<selector> when ' +
+  'scoped) in generated code. scopeName/scopeSelector only apply to a step NOT bound to a page-object ' +
+  'method (a page-object-bound step\'s scope comes from that method\'s own scope assignment instead -- see ' +
+  'set_method_scope): scopeSelector defines a new flow-local scope (reused by any later step in this SAME ' +
+  'flow that sets just scopeName to the same value); a step with only scopeName reuses whichever earlier ' +
+  'step in this flow first defined that name.'
 );
 
 server.registerTool(
@@ -411,7 +448,13 @@ server.registerTool(
 server.registerTool(
   'set_locator',
   {
-    description: 'Add or replace a locator on a page object. A selector containing ${paramName} blocks (bare names only, not expressions) becomes a parametric method automatically -- see extractPoParams.',
+    description:
+      'Add or replace a locator on a page object. `selector` is a Playwright locator-chain EXPRESSION -- ' +
+      'the text that goes after "page." (or the assigned scope\'s own expression, if this method has one ' +
+      'via set_method_scope) -- e.g. "getByRole(\'button\', { name: \'Submit\' })" or "locator(\'#submit\')", ' +
+      'never a bare selector-engine string. A ${paramName} block (bare names only, not expressions) inside ' +
+      'one of the expression\'s own string-literal arguments becomes a parametric method automatically -- ' +
+      'see extractPoParams.',
     inputSchema: { ...projectArg, pageObject: z.string(), method: z.string(), selector: z.string() },
   },
   safe(async ({ project, pageObject, method, selector }) => jsonResult(await (await resolveCore(project)).setLocator(pageObject, method, selector)))
@@ -426,13 +469,66 @@ server.registerTool(
   })
 );
 
+server.registerTool(
+  'set_scope',
+  {
+    description:
+      'Add or replace a SCOPE on a page object -- a root-element locator other locators on the same page ' +
+      'object can be nested under (see set_method_scope), so their own selectors only need to be unique ' +
+      'within it instead of the whole page. Useful for a reusable section (a modal, a repeated table row) ' +
+      '-- a page object already models either a full page or a section; scopes are what make the section ' +
+      'case actually robust. `scope` is stored as a bare camelCase name (auto-sanitized, e.g. "results") ' +
+      '-- "Scope" is appended only in generated code (e.g. resultsScope), not part of the stored name. ' +
+      '`selector` is a Playwright locator-chain expression, same format as set_locator\'s own (e.g. ' +
+      '"locator(\'.results\')") -- a ${paramName} block inside one of its string-literal arguments makes ' +
+      'it parametric, for a scope reused per row/instance -- rare in practice, most scopes are static.',
+    inputSchema: { ...projectArg, pageObject: z.string(), scope: z.string(), selector: z.string() },
+  },
+  safe(async ({ project, pageObject, scope, selector }) => jsonResult(await (await resolveCore(project)).setScope(pageObject, scope, selector)))
+);
+
+server.registerTool(
+  'remove_scope',
+  {
+    description: 'Remove a scope from a page object. Fails if any locator on the same page object is still assigned to it -- unassign with set_method_scope first (pass a null/omitted scope).',
+    inputSchema: { ...projectArg, pageObject: z.string(), scope: z.string() },
+  },
+  safe(async ({ project, pageObject, scope }) => {
+    await (await resolveCore(project)).removeScope(pageObject, scope);
+    return textResult(`Removed scope "${scope}" from "${pageObject}".`);
+  })
+);
+
+server.registerTool(
+  'set_method_scope',
+  {
+    description:
+      'Nest an existing locator under one of its OWN page object\'s scopes (create the scope first with ' +
+      'set_scope) -- generated code then reads it off that scope\'s own element instead of the whole page. ' +
+      'Omit/pass an empty scope to unassign, going back to page-wide.',
+    inputSchema: { ...projectArg, pageObject: z.string(), method: z.string(), scope: z.string().optional() },
+  },
+  safe(async ({ project, pageObject, method, scope }) => {
+    await (await resolveCore(project)).setMethodScope(pageObject, method, scope || null);
+    return textResult(scope ? `Nested locator "${method}" under scope "${scope}".` : `Unassigned locator "${method}"'s scope.`);
+  })
+);
+
 // ---------- scenarios ----------
 
 server.registerTool(
   'create_scenario',
   {
     description: 'Create a new, empty scenario.',
-    inputSchema: { ...projectArg, name: z.string(), id: z.string().optional(), folder: z.string().optional(), description: z.string().optional() },
+    inputSchema: {
+      ...projectArg,
+      name: z.string(),
+      id: z.string().optional(),
+      folder: z.string().optional(),
+      description: z.string().optional(),
+      preconditions: z.string().optional().describe('Setup/state assumed to already hold before this scenario runs.'),
+      notes: z.string().optional().describe('Caveats or instructions for anyone editing this scenario.'),
+    },
   },
   safe(async ({ project, ...rest }) => jsonResult(await (await resolveCore(project)).createScenario(rest)))
 );
@@ -553,6 +649,23 @@ server.registerTool(
 );
 
 server.registerTool(
+  'connect_panel',
+  {
+    description:
+      'Establish trust with a specific side panel by its session name, without setting ' +
+      'EASYSPEC_PANEL_SESSION and restarting this server. Pass the exact session name shown in the ' +
+      'target panel\'s own UI (e.g. "calm-yak-806409"); on a match the panel moves that connection ' +
+      'from unverified to connected. Returns immediately either way -- call live_status or check ' +
+      'the panel UI afterward to confirm it actually took.',
+    inputSchema: { sessionName: z.string().describe('The exact session name currently shown in the target side panel\'s UI.') },
+  },
+  safe(({ sessionName }) => {
+    bridge.setPanelSession(sessionName);
+    return textResult(`Sent "${sessionName}" to every connected side panel. Check live_status or the panel UI to confirm it was accepted.`);
+  })
+);
+
+server.registerTool(
   'live_replay_flow',
   {
     description:
@@ -613,12 +726,16 @@ server.registerTool(
     description:
       'Starts the element picker on the side panel\'s target tab (the pinned tab, or the active tab if ' +
       'none is pinned) and waits (up to 2 minutes) for the user to click something, returning the ' +
-      'resulting selector and its variants -- the same picker the step editor\'s "Pick element" button ' +
-      'uses. Requires the side panel open and connected.',
-    inputSchema: liveArg,
+      'resulting locator expression -- the same picker the step editor\'s "Pick element" button uses, ' +
+      'generated by the real Playwright engine (Locator.generateLocatorString()), ready to use as-is with ' +
+      'set_locator/set_scope or a step\'s own `selector`. Requires the side panel open and connected. Pass ' +
+      'pageObject+scope to restrict picking to that page object\'s named scope (see set_scope) -- only ' +
+      'elements inside the scope\'s own root element are hoverable/clickable. The scope must be ' +
+      'non-parametric -- a scope reused per row/instance has no single element to confine picking to here.',
+    inputSchema: { ...liveArg, pageObject: z.string().optional(), scope: z.string().optional() },
   },
-  safe(async ({ project, session }) => {
-    const result = await bridge.sendRequest(resolveLiveProject(project, session), 'pickElement', {}, undefined, session);
+  safe(async ({ project, session, pageObject, scope }) => {
+    const result = await bridge.sendRequest(resolveLiveProject(project, session), 'pickElement', { pageObject, scope }, undefined, session);
     if (!result.ok) throw new Error(result.error || 'Pick failed.');
     return jsonResult(result);
   })
