@@ -150,7 +150,7 @@ function safe(handler) {
   };
 }
 
-const server = new McpServer({ name: 'playwright-easy-spec', version: '1.1.0' });
+const server = new McpServer({ name: 'playwright-easy-spec', version: '1.1.1' });
 
 // ---------- inspection ----------
 
@@ -652,11 +652,11 @@ server.registerTool(
   'connect_panel',
   {
     description:
-      'Establish trust with a specific side panel by its session name, without setting ' +
-      'EASYSPEC_PANEL_SESSION and restarting this server. Pass the exact session name shown in the ' +
-      'target panel\'s own UI (e.g. "calm-yak-806409"); on a match the panel moves that connection ' +
-      'from unverified to connected. Returns immediately either way -- call live_status or check ' +
-      'the panel UI afterward to confirm it actually took.',
+      'Establish trust with a specific side panel by its session name -- the only way to do so, ' +
+      'since a new connection starts with no claim at all. Pass the exact session name shown in ' +
+      'the target panel\'s own UI (e.g. "calm-yak-806409"); on a match the panel moves that ' +
+      'connection from unverified to connected. Returns immediately either way -- call live_status ' +
+      'or check the panel UI afterward to confirm it actually took.',
     inputSchema: { sessionName: z.string().describe('The exact session name currently shown in the target side panel\'s UI.') },
   },
   safe(({ sessionName }) => {

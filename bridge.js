@@ -40,14 +40,6 @@ function agentName(port) {
 function buildBridgeApi(wss, port) {
   const AGENT_NAME = agentName(port); // stable for this port slot -- not random, see agentName's own comment
   const STARTED_AT = Date.now(); // this agent's own launch time -- NOT when any given panel connection opened (that's the panel's own connectedAt), so a reconnect doesn't reset it
-  // Seeded from the environment for backward compatibility, but no longer the only way to set it --
-  // see setPanelSession/connect_panel (mcp/server.js) for setting it live via a tool call instead
-  // of an env var fixed at process startup. A human copies the CURRENT value shown in the side
-  // panel's own UI (it's generated fresh per panel load, never persisted -- see sidepanel.js's
-  // SESSION_NAME). Presenting the right one lets that panel auto-approve this connection with no
-  // click; see sidepanel.js's trust-model comment (point 2) for the full design and why a bare
-  // claimed name elsewhere in this protocol is NOT proof.
-  let panelSession = process.env.EASYSPEC_PANEL_SESSION || null;
   const sidepanels = new Set(); // { ws, projectName }
   const pending = new Map(); // requestId -> { resolve, reject, timeout }
 
@@ -66,10 +58,10 @@ function buildBridgeApi(wss, port) {
     const client = { ws, projectName: null, sessionName: null };
     // Sent unprompted, before anything else -- gives the panel's approval UI a friendly name (and
     // this agent's real uptime, not just "since this particular reconnect") to show right away,
-    // independent of (and not gated by) approval itself. sessionName here is this agent's own
-    // best-effort claim (see PANEL_SESSION above) -- the panel is the one that actually verifies
-    // it against its own current value before treating it as proof of anything.
-    ws.send(JSON.stringify({ type: 'serverHello', agentName: AGENT_NAME, startedAt: STARTED_AT, sessionName: panelSession }));
+    // independent of (and not gated by) approval itself. No sessionName claim on this first
+    // message -- a brand-new connection has no proof to offer yet, so it starts out silent/pending
+    // until setPanelSession (connect_panel, mcp/server.js) claims one for it explicitly.
+    ws.send(JSON.stringify({ type: 'serverHello', agentName: AGENT_NAME, startedAt: STARTED_AT, sessionName: null }));
     ws.on('message', (raw) => {
       let msg;
       try {
@@ -161,16 +153,18 @@ function buildBridgeApi(wss, port) {
     return [...sidepanels].map((c) => ({ projectName: c.projectName, sessionName: c.sessionName }));
   }
 
-  // Lets an MCP tool call (connect_panel, mcp/server.js) claim trust live instead of only at
-  // process startup via EASYSPEC_PANEL_SESSION. Re-sends 'serverHello' to every currently open
-  // connection -- not just ones already in `sidepanels`, since a brand-new connection's 'hello'
-  // may not have arrived yet -- so each side panel re-runs its own verification against the new
-  // value immediately, exactly as it would on a fresh connect. There's no ack back from the panel
+  // How an MCP tool call (connect_panel, mcp/server.js) claims trust: re-sends 'serverHello' to
+  // every currently open connection (not just ones already in `sidepanels`, since a brand-new
+  // connection's 'hello' may not have arrived yet) so each side panel re-runs its own verification
+  // against the new value right away. Deliberately a ONE-SHOT push, nothing stored here for a
+  // connection that opens LATER -- the panel this targets can rotate its own session name at any
+  // time (a reload), and a future connection has no way to know whether a remembered name is still
+  // current, so it starts that connection silent/pending (see the 'connection' handler above)
+  // rather than risk replaying a now-stale claim as a wrong one. There's no ack back from the panel
   // (see sidepanel.js's approveBridgeConnection): trust is local, browser-side state this process
   // can't observe, so the caller confirms success via live_status or the panel UI itself.
   function setPanelSession(name) {
-    panelSession = name || null;
-    const hello = JSON.stringify({ type: 'serverHello', agentName: AGENT_NAME, startedAt: STARTED_AT, sessionName: panelSession });
+    const hello = JSON.stringify({ type: 'serverHello', agentName: AGENT_NAME, startedAt: STARTED_AT, sessionName: name || null });
     for (const client of wss.clients) {
       if (client.readyState === client.OPEN) client.send(hello);
     }
