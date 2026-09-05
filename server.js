@@ -150,7 +150,7 @@ function safe(handler) {
   };
 }
 
-const server = new McpServer({ name: 'playwright-easy-spec', version: '1.1.1' });
+const server = new McpServer({ name: 'playwright-easy-spec', version: '1.1.2' });
 
 // ---------- inspection ----------
 
@@ -300,16 +300,19 @@ server.registerTool(
 // entirely on `kind` (this mirrors how the step editor's own form shows/hides fields by kind).
 const stepSchema = z.object({}).passthrough().describe(
   'A step object: { kind, method, selector?, pageObjectName?, pageObjectMethod?, pageObjectArgs?, ' +
-  'elementAlias?, scopeName?, scopeSelector?, args?, options?, negate?, variable?, condition?, init?, ' +
-  'update?, steps?, iterableName?, itemVarName? } -- same shape as a flow.json step; see get_flow on an ' +
-  'existing flow for real examples of each kind. `selector`/`scopeSelector` are Playwright locator-chain ' +
+  'elementAlias?, scopeName?, scopeSelector?, args?, options?, negate?, variable?, utilName?, condition?, ' +
+  'init?, update?, steps?, iterableName?, itemVarName? } -- same shape as a flow.json step; see get_flow on ' +
+  'an existing flow for real examples of each kind. `selector`/`scopeSelector` are Playwright locator-chain ' +
   'EXPRESSIONS (see get_page_object\'s own description), not bare selector-engine strings -- e.g. ' +
   '"getByRole(\'button\', { name: \'Submit\' })", spliced as page.<selector> (or <scope>.<selector> when ' +
   'scoped) in generated code. scopeName/scopeSelector only apply to a step NOT bound to a page-object ' +
   'method (a page-object-bound step\'s scope comes from that method\'s own scope assignment instead -- see ' +
   'set_method_scope): scopeSelector defines a new flow-local scope (reused by any later step in this SAME ' +
   'flow that sets just scopeName to the same value); a step with only scopeName reuses whichever earlier ' +
-  'step in this flow first defined that name.'
+  'step in this flow first defined that name. For kind "raw": either a bare `raw` (inline code, unique to ' +
+  'this step) OR a `utilName` (calls a shared, project-wide function by name instead -- see ' +
+  'create_util/set_util_body/set_util_params -- passing `args` as its call arguments and, if `variable` is ' +
+  'set, assigning its return value there), never both.'
 );
 
 server.registerTool(
@@ -514,6 +517,76 @@ server.registerTool(
   })
 );
 
+// ---------- utils (project-wide shared functions a `raw` step can call by name -- see
+// add_step's own stepSchema doc for the utilName/args/variable fields) ----------
+
+server.registerTool(
+  'list_utils',
+  { description: 'List shared utility functions in a project (name, folder, param count).', inputSchema: projectArg },
+  safe(async ({ project }) => {
+    const core = await resolveCore(project);
+    const names = await core.listUtilNames();
+    const out = [];
+    for (const name of names) {
+      const util = await core.loadUtil(name);
+      out.push({ name, folder: util.folder || '', params: util.params || [] });
+    }
+    return jsonResult(out);
+  })
+);
+
+server.registerTool(
+  'get_util',
+  { description: 'Get a shared utility function\'s full definition (params + body).', inputSchema: { ...projectArg, name: z.string() } },
+  safe(async ({ project, name }) => {
+    const core = await resolveCore(project);
+    const util = await core.loadUtil(name);
+    if (!util) throw new Error(`Util "${name}" not found.`);
+    return jsonResult(util);
+  })
+);
+
+server.registerTool(
+  'create_util',
+  { description: 'Create a new, empty shared utility function (no params, empty body).', inputSchema: { ...projectArg, name: z.string(), folder: z.string().optional() } },
+  safe(async ({ project, name, folder }) => jsonResult(await (await resolveCore(project)).createUtil(name, folder)))
+);
+
+server.registerTool(
+  'set_util_body',
+  {
+    description:
+      'Set a shared utility function\'s body -- plain TypeScript statements, no wrapping `async function ' +
+      '(...) { }` (that\'s generated automatically from this body + the function\'s own params, see ' +
+      'set_util_params). Creates the util on first use if `name` doesn\'t exist yet. A `raw` step names ' +
+      'this function via its own `utilName` field (see add_step) instead of inlining code -- every step ' +
+      'naming the same util calls this one shared function, so editing it here updates every call site at once.',
+    inputSchema: { ...projectArg, name: z.string(), body: z.string() },
+  },
+  safe(async ({ project, name, body }) => jsonResult(await (await resolveCore(project)).setUtilBody(name, body)))
+);
+
+server.registerTool(
+  'set_util_params',
+  { description: 'Set a shared utility function\'s ordered parameter names (bare identifiers, e.g. ["sql", "params"]).', inputSchema: { ...projectArg, name: z.string(), params: z.array(z.string()) } },
+  safe(async ({ project, name, params }) => jsonResult(await (await resolveCore(project)).setUtilParams(name, params)))
+);
+
+server.registerTool(
+  'delete_util',
+  {
+    description:
+      'Delete a shared utility function. Does NOT check whether any flow step still names it via ' +
+      'utilName -- check list_flows/get_flow first (same caveat as delete_page_object: this is a bare ' +
+      'delete, no reference cascade).',
+    inputSchema: { ...projectArg, name: z.string() },
+  },
+  safe(async ({ project, name }) => {
+    await (await resolveCore(project)).deleteUtil(name);
+    return textResult(`Deleted util "${name}".`);
+  })
+);
+
 // ---------- scenarios ----------
 
 server.registerTool(
@@ -608,6 +681,66 @@ server.registerTool(
   'remove_scenario_dataset',
   { description: 'Remove a named scenario-data dataset.', inputSchema: { ...projectArg, scenarioId: z.string(), name: z.string() } },
   safe(async ({ project, scenarioId, name }) => jsonResult(await (await resolveCore(project)).removeScenarioDataset(scenarioId, name)))
+);
+
+// ---------- suites (virtual, multi-membership groupings over existing scenarios -- the Suites tab) ----------
+// A suite entry is a PLACEMENT, never a copy of the scenario: { id, path, scenarioId }. The same
+// scenarioId can have any number of entries, each at its own path -- that's what lets one scenario
+// belong to e.g. both "regression/checkout" and "smoke" at once. Deleting an entry only removes
+// that placement, never the underlying scenario.
+
+server.registerTool(
+  'list_suites',
+  { description: 'List every suite entry in a project: id, folder path, which scenario it points at (plus that scenario\'s own name, for convenience), and its own saved run params (datasetTokens/useYaml/yaml, same shape add_flow_to_scenario stores -- absent means the scenario\'s own default dataset). A suite entry is a SAVED RUN, not a bare reference -- the same scenarioId can appear more than once, at different paths or even the same one, each with its own independent params.', inputSchema: projectArg },
+  safe(async ({ project }) => {
+    const core = await resolveCore(project);
+    const [entries, scenarioIds] = await Promise.all([core.loadSuites(), core.listScenarioIds()]);
+    const names = {};
+    for (const id of scenarioIds) names[id] = (await core.loadScenario(id)).name;
+    return jsonResult(entries.map((e) => ({
+      id: e.id, path: e.path, scenarioId: e.scenarioId, scenarioName: names[e.scenarioId] || '(missing scenario)',
+      datasetTokens: e.datasetTokens, useYaml: e.useYaml, yaml: e.yaml,
+    })));
+  })
+);
+
+server.registerTool(
+  'add_to_suite',
+  {
+    description:
+      'Place an existing scenario at a suite folder path (e.g. "regression/checkout", or "" for ' +
+      'the root) as a SAVED RUN, not a bare reference -- `datasetTokens`/`useYaml`/`yaml` are the ' +
+      'exact same run-config fields add_flow_to_scenario stores (a comma/space-separated list of ' +
+      'this scenario\'s own dataset indices/names, or `useYaml`+`yaml` as a raw literal-value ' +
+      'fallback; omit all three to use the scenario\'s own default dataset). Adds a NEW placement -- ' +
+      'calling this again for the same scenarioId (same path or a different one, same params or ' +
+      'different) places it again, it does not move or merge with an existing entry.',
+    inputSchema: {
+      ...projectArg, scenarioId: z.string(), path: z.string().optional(),
+      datasetTokens: z.string().optional(), useYaml: z.boolean().optional(), yaml: z.string().optional(),
+    },
+  },
+  safe(async ({ project, scenarioId, path, datasetTokens, useYaml, yaml }) =>
+    jsonResult(await (await resolveCore(project)).addSuiteEntry(path || '', scenarioId, { datasetTokens, useYaml, yaml }))
+  )
+);
+
+server.registerTool(
+  'remove_from_suite',
+  { description: 'Remove one suite placement by its entry id (see list_suites). Only removes that placement -- the underlying scenario, and any of its OTHER placements, are untouched.', inputSchema: { ...projectArg, entryId: z.string() } },
+  safe(async ({ project, entryId }) => {
+    await (await resolveCore(project)).removeSuiteEntry(entryId);
+    return textResult(`Removed suite entry "${entryId}".`);
+  })
+);
+
+server.registerTool(
+  'move_suite_entry',
+  { description: 'Move one suite placement (by its entry id, see list_suites) to a different folder path.', inputSchema: { ...projectArg, entryId: z.string(), path: z.string() } },
+  safe(async ({ project, entryId, path }) => {
+    await (await resolveCore(project)).moveSuiteEntry(entryId, path);
+    return textResult(`Moved suite entry "${entryId}" to "${path || '(root)'}".`);
+  })
 );
 
 // ---------- variables ----------
@@ -996,6 +1129,83 @@ server.registerTool(
     const result = await bridge.sendRequest(resolveLiveProject(project, session), 'cancelScenarioRun', { runId }, undefined, session);
     if (!result.ok) throw new Error(result.error || 'Failed to cancel scenario run.');
     return textResult(`Scenario run "${runId}" cancelled.`);
+  })
+);
+
+server.registerTool(
+  'live_run_suite',
+  {
+    description:
+      'Runs a suite (or a single suite entry) live, in parallel, across `workerCount` concurrently-' +
+      'opened dedicated tabs (a global variable, see set_variable/get_variables -- defaults to 1), ' +
+      'trying each failing run up to `attempts` TOTAL times (another global variable, defaults to ' +
+      '1) on the same worker tab before giving up. A run that fails at least once but eventually ' +
+      'passes is reported as "flaky", never "passed" or "failed". Pass exactly one of `path` (every ' +
+      'entry placed at or under that suite folder, each expanded to its own saved run(s) -- see ' +
+      'add_to_suite/list_suites; entries are NOT deduplicated by scenario, two placements of the ' +
+      'same scenario with different saved params both genuinely run -- "" or omitted means the ' +
+      'WHOLE suites tree) or `scenarioIds` (an explicit list bypassing suite membership entirely, ' +
+      'each run with that scenario\'s own default dataset). Returns immediately with a `runId`; ' +
+      'poll live_get_suite_run (or live_list_suite_runs) to check progress/outcome -- this does ' +
+      'NOT wait for the run to finish. ' +
+      'Each individual scenario attempt is also an ordinary scenario run, independently visible via ' +
+      'live_list_scenario_runs/live_get_scenario_run. Requires the side panel open and connected.',
+    inputSchema: {
+      ...liveArg,
+      path: z.string().optional(),
+      scenarioIds: z.array(z.string()).optional(),
+    },
+  },
+  safe(async ({ project, session, path, scenarioIds }) => {
+    const result = await bridge.sendRequest(resolveLiveProject(project, session), 'startSuiteRun', { path, scenarioIds }, undefined, session);
+    if (!result.ok) throw new Error(result.error || 'Failed to start suite run.');
+    return jsonResult({ runId: result.runId, scenarioCount: result.scenarioCount });
+  })
+);
+
+server.registerTool(
+  'live_list_suite_runs',
+  {
+    description:
+      'Lists suite runs on the connected side panel: `current` (still running) and `history` ' +
+      '(finished/cancelled this session, most recent first, capped at 30). Each entry has the ' +
+      'overall status and a per-scenario breakdown (status: pending/running/passed/flaky/failed, ' +
+      'attempts count). Safe to poll repeatedly.',
+    inputSchema: liveArg,
+  },
+  safe(async ({ project, session }) => {
+    const result = await bridge.sendRequest(resolveLiveProject(project, session), 'listSuiteRuns', {}, undefined, session);
+    if (!result.ok) throw new Error(result.error || 'Failed to list suite runs.');
+    return jsonResult({ current: result.current, history: result.history });
+  })
+);
+
+server.registerTool(
+  'live_get_suite_run',
+  {
+    description: 'Full detail for one suite run started via live_run_suite, by its `runId`.',
+    inputSchema: { ...liveArg, runId: z.string() },
+  },
+  safe(async ({ project, session, runId }) => {
+    const result = await bridge.sendRequest(resolveLiveProject(project, session), 'getSuiteRun', { runId }, undefined, session);
+    if (!result.ok) throw new Error(result.error || 'Failed to get suite run.');
+    return jsonResult(result.run);
+  })
+);
+
+server.registerTool(
+  'live_cancel_suite_run',
+  {
+    description:
+      'Cancels a still-running suite run by its `runId` -- force-interrupts whatever\'s actually in ' +
+      'flight on every worker tab right now (same as live_cancel_scenario_run does for a single ' +
+      'scenario run) and stops every worker from picking up anything further off the queue.',
+    inputSchema: { ...liveArg, runId: z.string() },
+  },
+  safe(async ({ project, session, runId }) => {
+    const result = await bridge.sendRequest(resolveLiveProject(project, session), 'cancelSuiteRun', { runId }, undefined, session);
+    if (!result.ok) throw new Error(result.error || 'Failed to cancel suite run.');
+    return textResult(`Suite run "${runId}" cancelled.`);
   })
 );
 
