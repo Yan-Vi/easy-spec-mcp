@@ -47,10 +47,13 @@ const projectArg = {
 
 // Sibling of projectArg for the live_* tools specifically (see bridge.js's sendRequest) --
 // disambiguates WHICH connected side panel to target when more than one is connected to the same
-// project (see sidepanel.js's SESSION_NAME / live_status's own "sessions" list for the names).
+// project (see live_status's own "sessions" list for the ids). This is a bridge-assigned OPAQUE
+// id, never the panel's own secret SESSION_NAME -- that value never travels from a panel to this
+// server in any form; the only way it ever reaches an MCP client is a human reading it off their
+// own panel and passing it to connect_panel directly.
 const liveArg = {
   ...projectArg,
-  session: z.string().optional().describe('Which connected side panel to target, by its short session name (e.g. "eager-beaver", see live_status) -- only needed when more than one side panel is connected to the same project.'),
+  session: z.string().optional().describe('Which connected side panel to target, by its connection id (see live_status) -- only needed when more than one side panel is connected to the same project.'),
 };
 
 function soleConnectedName() {
@@ -103,15 +106,15 @@ async function resolveCore(project) {
 // which session it wants (e.g. two panels both named "test", disambiguated by session alone)
 // would still hit "multiple side panels connected" here before sendRequest's OWN session
 // filtering (bridge.js) ever got a chance to run, since this always resolves first.
-// There's no per-request signing anymore -- the side panel gates every live_* action on a human
-// having clicked Approve on this specific connection (see sidepanel.js's bridgePending/
-// bridgeTrusted), not on anything this server sends.
+// There's no per-request signing anymore -- the side panel gates every live_* action entirely on
+// its own side, by requiring an agent's serverHello to have presented the panel's own real
+// SESSION_NAME (see sidepanel.js's trust-model comment) -- not on anything this server sends.
 function resolveLiveProject(project, session) {
   if (session) {
-    const match = bridge.connectedSessions().find((s) => s.sessionName === session);
+    const match = bridge.connectedSessions().find((s) => s.connectionId === session);
     if (!match) {
-      const available = bridge.connectedSessions().map((s) => s.sessionName || '(unnamed)').join(', ') || '(none connected)';
-      throw new Error(`No side panel named "${session}" is connected. Connected: ${available}`);
+      const available = bridge.connectedSessions().map((s) => s.connectionId).join(', ') || '(none connected)';
+      throw new Error(`No side panel with connection id "${session}" is connected. Connected: ${available}`);
     }
     return match.projectName; // may be null -- that session has no project connected, which is fine for the live_* tools
   }
@@ -123,8 +126,8 @@ function resolveLiveProject(project, session) {
   const sessions = bridge.connectedSessions();
   if (sessions.length === 1) return sessions[0].projectName;
   if (sessions.length > 1) {
-    const names = sessions.map((s) => s.sessionName || '(unnamed)').join(', ');
-    throw new Error(`Multiple side panels are connected (${names}) -- pass \`project\` or \`session\` to say which one.`);
+    const ids = sessions.map((s) => s.connectionId).join(', ');
+    throw new Error(`Multiple side panels are connected (${ids}) -- pass \`project\` or \`session\` to say which one.`);
   }
   throw new Error('No side panel is connected -- pass `project`/`session`, set EASYSPEC_PROJECT, or open the extension (check with live_status).');
 }
@@ -150,7 +153,7 @@ function safe(handler) {
   };
 }
 
-const server = new McpServer({ name: 'playwright-easy-spec', version: '1.1.2' });
+const server = new McpServer({ name: 'playwright-easy-spec', version: '1.1.3' });
 
 // ---------- inspection ----------
 
@@ -773,9 +776,13 @@ server.registerTool(
       '`agentName` is THIS server\'s own stable name (e.g. "claude-1", tied to its port slot, not random) -- shown in the ' +
       'side panel\'s pending-connection list when it asks the user to approve this agent, so telling the ' +
       'user this name lets them confirm which pending entry to click Approve on. `sessions` gives each ' +
-      'connected panel\'s own short random name (e.g. "eager-beaver") -- only relevant once more than one ' +
-      'panel has approved THIS agent at once; pass one as `session` on another live_* tool to target it ' +
-      'specifically instead of hitting the "more than one side panel connected" ambiguity error.',
+      'connected panel\'s own OPAQUE connection id (e.g. "a1b2c3d4", assigned by this bridge, meaningless ' +
+      'on its own, and NOT the panel\'s own secret session name -- that value never travels from a panel ' +
+      'to this server in any form) -- only relevant once more than one panel is connected at once; pass ' +
+      'one as `session` on another live_* tool to target it specifically instead of hitting the "more than ' +
+      'one side panel connected" ambiguity error. This never reveals a session name you weren\'t already ' +
+      'told directly by the user -- the only way one reaches you at all is the user pasting it into ' +
+      'connect_panel themselves.',
     inputSchema: {},
   },
   safe(() => jsonResult({ connectedProjects: bridge.connectedProjectNames(), sessions: bridge.connectedSessions(), agentName: bridge.agentName }))

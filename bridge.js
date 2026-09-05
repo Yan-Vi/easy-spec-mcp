@@ -17,6 +17,7 @@
 // Node `ws` client does (which is what the CLI's own best-effort client looks like, since Node
 // isn't a browser and has no Origin to enforce either way).
 const path = require('path');
+const crypto = require('crypto');
 
 const DEFAULT_PORT = 58473;
 // More than one MCP server process (one per agent/session) can run on the same machine at once --
@@ -55,7 +56,14 @@ function buildBridgeApi(wss, port) {
   }
 
   wss.on('connection', (ws) => {
-    const client = { ws, projectName: null, sessionName: null };
+    // connectionId: an OPAQUE, non-secret label this bridge assigns itself, purely to disambiguate
+    // "which of several connected panels do you mean" (see connectedSessions/sendRequest below) --
+    // NOT a credential. The panel's own real secret (SESSION_NAME, sidepanel.js) never reaches this
+    // process in any message, in either direction the panel initiates -- see hello's own comment
+    // below -- so this bridge has nothing meaningful to leak even if connectedSessions() is read by
+    // a caller who was never told anything by a human. The only way a real session name ever
+    // reaches an MCP client is a human copy/pasting it into connect_panel -- never a tool result.
+    const client = { ws, projectName: null, connectionId: crypto.randomBytes(4).toString('hex') };
     // Sent unprompted, before anything else -- gives the panel's approval UI a friendly name (and
     // this agent's real uptime, not just "since this particular reconnect") to show right away,
     // independent of (and not gated by) approval itself. No sessionName claim on this first
@@ -73,10 +81,12 @@ function buildBridgeApi(wss, port) {
         // Registering as a panel isn't gated by anything on this side -- the panel dials every
         // port in the shared discovery range indiscriminately (see sidepanel.js's
         // connectBridgeAll). The real gate lives entirely on the panel's own side: it puts every
-        // new connection in a pending list and won't act on anything it sends until a human
-        // clicks Approve (see sidepanel.js's bridgePending/bridgeTrusted and handleBridgeMessage).
+        // new connection in a pending list and won't act on anything it sends until its own
+        // sessionName check passes (see sidepanel.js's bridgePending/bridgeTrusted and
+        // handleBridgeMessage) -- there's no manual-approval fallback, that check is the only gate.
+        // msg.sessionName is deliberately never read here (and sidepanel.js's own hello never sends
+        // it) -- see this client's own connectionId comment above.
         client.projectName = msg.projectName || null;
-        client.sessionName = msg.sessionName || null; // human-readable ("eager-beaver") -- see sidepanel.js's own SESSION_NAME
         sidepanels.add(client);
       } else if (msg.type === 'cliNotify') {
         for (const target of findPanelsFor(msg.project)) {
@@ -107,27 +117,27 @@ function buildBridgeApi(wss, port) {
   // `requestType` is 'replay', 'pickElement', or 'runStep' (see sidepanel.js's handleBridgeMessage
   // for what each does and what `payload` each expects) -- using its own real chrome.debugger
   // session, the user's real tab and login state, and waits for the matching `<type>Result`.
-  // There's no token/secret on this request -- the side panel gates execution on its own side by
-  // requiring a human to have clicked Approve on this exact connection first (see sidepanel.js's
-  // bridgePending/bridgeTrusted and its own comment on why that's a UI decision, not a crypto one).
-  function sendRequest(projectDir, requestType, payload, timeoutMs = 10 * 60 * 1000, sessionName) {
+  // There's no token/secret on this request -- the side panel gates every live_* action entirely
+  // on its own side, by requiring an agent's serverHello to have presented the panel's own real
+  // SESSION_NAME (see sidepanel.js's trust-model comment) -- nothing this bridge sends or tracks.
+  function sendRequest(projectDir, requestType, payload, timeoutMs = 10 * 60 * 1000, connectionId) {
     let targets = findPanelsFor(projectDir);
-    // Explicit session scoping (see mcp/server.js's liveArg/live_status) -- narrows straight to the
-    // one named panel, so a caller who already knows which session it wants never hits the
+    // Explicit connectionId scoping (see mcp/server.js's liveArg/live_status) -- narrows straight
+    // to the one matching panel, so a caller who already knows which one it wants never hits the
     // ambiguity error below just because a second, unrelated panel happens to share the project.
-    if (sessionName) {
-      const named = targets.filter((t) => t.sessionName === sessionName);
+    if (connectionId) {
+      const named = targets.filter((t) => t.connectionId === connectionId);
       if (!named.length) {
-        const available = targets.map((t) => t.sessionName || '(unnamed)').join(', ') || '(none connected)';
-        throw new Error(`No side panel named "${sessionName}" is connected to this project. Connected: ${available}`);
+        const available = targets.map((t) => t.connectionId).join(', ') || '(none connected)';
+        throw new Error(`No side panel with connection id "${connectionId}" is connected to this project. Connected: ${available}`);
       }
-      targets = named; // sessionName is unique per connection (see sidepanel.js's SESSION_NAME), so this is always exactly one
+      targets = named; // connectionId is unique per connection (assigned fresh by this bridge), so this is always exactly one
     }
     const scope = projectDir ? 'for this project' : 'with no project connected';
     if (!targets.length) throw new Error(`No side panel connected ${scope} -- open the side panel${projectDir ? ' and connect this folder' : ''} first.`);
     if (targets.length > 1) {
-      const names = targets.map((t) => t.sessionName || '(unnamed)').join(', ');
-      throw new Error(`More than one side panel is connected ${scope} (${names}) -- pass \`session\` to say which one, or close all but one and try again.`);
+      const ids = targets.map((t) => t.connectionId).join(', ');
+      throw new Error(`More than one side panel is connected ${scope} (${ids}) -- pass \`session\` with one of these connection ids to say which one, or close all but one and try again.`);
     }
     const requestId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
     return new Promise((resolve, reject) => {
@@ -144,13 +154,13 @@ function buildBridgeApi(wss, port) {
     return [...sidepanels].map((c) => c.projectName).filter(Boolean);
   }
 
-  // Richer sibling of connectedProjectNames -- for live_status (mcp/server.js), so both the
-  // connected agent and a human with several panels/windows open can tell which is which by name
-  // instead of just by project (multiple panels CAN be open on different projects at once, and
-  // even on the same one, just not usable for live_* calls at the same time -- see sendRequest's
-  // own >1 guard above).
+  // Richer sibling of connectedProjectNames -- for live_status (mcp/server.js), so a caller with
+  // several panels/windows open on the same project can disambiguate (see sendRequest's own >1
+  // guard above). Exposes each connection's OPAQUE connectionId only -- never anything the panel
+  // itself considers secret (it never told this bridge anything secret to begin with -- see this
+  // client's own connectionId comment in the 'connection' handler above).
   function connectedSessions() {
-    return [...sidepanels].map((c) => ({ projectName: c.projectName, sessionName: c.sessionName }));
+    return [...sidepanels].map((c) => ({ projectName: c.projectName, connectionId: c.connectionId }));
   }
 
   // How an MCP tool call (connect_panel, mcp/server.js) claims trust: re-sends 'serverHello' to
