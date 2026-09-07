@@ -153,7 +153,7 @@ function safe(handler) {
   };
 }
 
-const server = new McpServer({ name: 'playwright-easy-spec', version: '1.1.3' });
+const server = new McpServer({ name: 'playwright-easy-spec', version: '1.1.4' });
 
 // ---------- inspection ----------
 
@@ -303,7 +303,7 @@ server.registerTool(
 // entirely on `kind` (this mirrors how the step editor's own form shows/hides fields by kind).
 const stepSchema = z.object({}).passthrough().describe(
   'A step object: { kind, method, selector?, pageObjectName?, pageObjectMethod?, pageObjectArgs?, ' +
-  'elementAlias?, scopeName?, scopeSelector?, args?, options?, negate?, variable?, utilName?, condition?, ' +
+  'elementAlias?, scopeName?, scopeSelector?, args?, options?, negate?, variable?, raw?, condition?, ' +
   'init?, update?, steps?, iterableName?, itemVarName? } -- same shape as a flow.json step; see get_flow on ' +
   'an existing flow for real examples of each kind. `selector`/`scopeSelector` are Playwright locator-chain ' +
   'EXPRESSIONS (see get_page_object\'s own description), not bare selector-engine strings -- e.g. ' +
@@ -312,10 +312,14 @@ const stepSchema = z.object({}).passthrough().describe(
   'method (a page-object-bound step\'s scope comes from that method\'s own scope assignment instead -- see ' +
   'set_method_scope): scopeSelector defines a new flow-local scope (reused by any later step in this SAME ' +
   'flow that sets just scopeName to the same value); a step with only scopeName reuses whichever earlier ' +
-  'step in this flow first defined that name. For kind "raw": either a bare `raw` (inline code, unique to ' +
-  'this step) OR a `utilName` (calls a shared, project-wide function by name instead -- see ' +
-  'create_util/set_util_body/set_util_params -- passing `args` as its call arguments and, if `variable` is ' +
-  'set, assigning its return value there), never both.'
+  'step in this flow first defined that name. `kind: "raw"` is ONLY for genuinely inline, unnamed code ' +
+  '(the `raw` field, its own JS/TS statement(s)). Calling a shared, project-wide Util function instead ' +
+  '(see create_util/set_util_body/set_util_params/set_util_group_name) is NOT a `raw` step at all -- the ' +
+  'step\'s own `kind` IS the util\'s current group name (every util always belongs to a group, defaulting ' +
+  'to "custom-utils"; see list_util_groups), and `method` names which function within it, exactly like ' +
+  'kind:"context"+method:"clearCookies" -- e.g. { kind: "custom-utils", method: "connectDb", args?, ' +
+  'variable? }. Look up a util\'s current groupName via get_util/list_utils before authoring a step that ' +
+  'calls it.'
 );
 
 server.registerTool(
@@ -520,19 +524,20 @@ server.registerTool(
   })
 );
 
-// ---------- utils (project-wide shared functions a `raw` step can call by name -- see
-// add_step's own stepSchema doc for the utilName/args/variable fields) ----------
+// ---------- utils (project-wide shared functions a step can call by name instead of inlining code
+// -- see add_step's own stepSchema doc for the kind/method/args/variable shape). Every util always
+// belongs to a group (defaulting to "custom-utils") -- there is no ungrouped state. ----------
 
 server.registerTool(
   'list_utils',
-  { description: 'List shared utility functions in a project (name, folder, param count).', inputSchema: projectArg },
+  { description: 'List shared utility functions in a project (name, groupName, folder, param count).', inputSchema: projectArg },
   safe(async ({ project }) => {
     const core = await resolveCore(project);
     const names = await core.listUtilNames();
     const out = [];
     for (const name of names) {
       const util = await core.loadUtil(name);
-      out.push({ name, folder: util.folder || '', params: util.params || [] });
+      out.push({ name, groupName: util.groupName, folder: util.folder || '', params: util.params || [] });
     }
     return jsonResult(out);
   })
@@ -540,7 +545,7 @@ server.registerTool(
 
 server.registerTool(
   'get_util',
-  { description: 'Get a shared utility function\'s full definition (params + body).', inputSchema: { ...projectArg, name: z.string() } },
+  { description: 'Get a shared utility function\'s full definition (groupName + params + body). A step calling it uses `kind: groupName, method: name` -- see add_step\'s own stepSchema doc.', inputSchema: { ...projectArg, name: z.string() } },
   safe(async ({ project, name }) => {
     const core = await resolveCore(project);
     const util = await core.loadUtil(name);
@@ -551,8 +556,11 @@ server.registerTool(
 
 server.registerTool(
   'create_util',
-  { description: 'Create a new, empty shared utility function (no params, empty body).', inputSchema: { ...projectArg, name: z.string(), folder: z.string().optional() } },
-  safe(async ({ project, name, folder }) => jsonResult(await (await resolveCore(project)).createUtil(name, folder)))
+  {
+    description: 'Create a new, empty shared utility function (no params, empty body). Lands in the given group, defaulting to "custom-utils" if omitted -- see list_util_groups/create_util_group.',
+    inputSchema: { ...projectArg, name: z.string(), folder: z.string().optional(), groupName: z.string().optional() },
+  },
+  safe(async ({ project, name, folder, groupName }) => jsonResult(await (await resolveCore(project)).createUtil(name, folder, groupName)))
 );
 
 server.registerTool(
@@ -561,9 +569,11 @@ server.registerTool(
     description:
       'Set a shared utility function\'s body -- plain TypeScript statements, no wrapping `async function ' +
       '(...) { }` (that\'s generated automatically from this body + the function\'s own params, see ' +
-      'set_util_params). Creates the util on first use if `name` doesn\'t exist yet. A `raw` step names ' +
-      'this function via its own `utilName` field (see add_step) instead of inlining code -- every step ' +
-      'naming the same util calls this one shared function, so editing it here updates every call site at once.',
+      'set_util_params). Creates the util on first use if `name` doesn\'t exist yet (landing in ' +
+      '"custom-utils" -- move it afterward with set_util_group_name if needed). A step names this ' +
+      'function via `kind: <its groupName>, method: name` (see add_step) instead of inlining code -- ' +
+      'every step naming the same util calls this one shared function, so editing it here updates every ' +
+      'call site at once.',
     inputSchema: { ...projectArg, name: z.string(), body: z.string() },
   },
   safe(async ({ project, name, body }) => jsonResult(await (await resolveCore(project)).setUtilBody(name, body)))
@@ -579,14 +589,80 @@ server.registerTool(
   'delete_util',
   {
     description:
-      'Delete a shared utility function. Does NOT check whether any flow step still names it via ' +
-      'utilName -- check list_flows/get_flow first (same caveat as delete_page_object: this is a bare ' +
-      'delete, no reference cascade).',
+      'Delete a shared utility function. Does NOT check whether any flow step still calls it (via ' +
+      'kind: groupName, method: name) -- check list_flows/get_flow first (same caveat as ' +
+      'delete_page_object: this is a bare delete, no reference cascade).',
     inputSchema: { ...projectArg, name: z.string() },
   },
   safe(async ({ project, name }) => {
     await (await resolveCore(project)).deleteUtil(name);
     return textResult(`Deleted util "${name}".`);
+  })
+);
+
+// ---------- util groups (one shared .ts file per group, holding every member util's own export --
+// mirrors how a Page Object groups multiple locator methods into one class file) ----------
+
+server.registerTool(
+  'list_util_groups',
+  { description: 'List util groups in a project (name, folder, member count). "custom-utils" always exists as the default group, even before it\'s ever been explicitly used.', inputSchema: projectArg },
+  safe(async ({ project }) => {
+    const core = await resolveCore(project);
+    const names = await core.listUtilGroupNames();
+    const out = [];
+    for (const name of names) {
+      const group = await core.loadUtilGroup(name);
+      const members = await core.utilsInGroup(name);
+      out.push({ name, folder: group.folder || '', memberCount: members.length });
+    }
+    return jsonResult(out);
+  })
+);
+
+server.registerTool(
+  'get_util_group',
+  { description: 'Get a util group\'s metadata plus its member utils\' names/params.', inputSchema: { ...projectArg, name: z.string() } },
+  safe(async ({ project, name }) => {
+    const core = await resolveCore(project);
+    const group = await core.loadUtilGroup(name);
+    if (!group) throw new Error(`Util group "${name}" not found.`);
+    const members = await core.utilsInGroup(name);
+    return jsonResult({ ...group, members: members.map((u) => ({ name: u.name, params: u.params || [] })) });
+  })
+);
+
+server.registerTool(
+  'create_util_group',
+  { description: 'Create a new, empty util group. Groups are also created automatically the first time a util is placed in one (create_util\'s groupName, or set_util_group_name) -- this is only needed to make an empty one exist in advance.', inputSchema: { ...projectArg, name: z.string(), folder: z.string().optional() } },
+  safe(async ({ project, name, folder }) => jsonResult(await (await resolveCore(project)).createUtilGroup(name, folder)))
+);
+
+server.registerTool(
+  'set_util_group_name',
+  {
+    description:
+      'Move an existing util into a (possibly brand-new) group -- e.g. moving "connectDb" out of ' +
+      '"custom-utils" into a new "db-helpers" group. Rewrites every referencing step\'s own `kind` across ' +
+      'every flow that calls it (a util-bound step\'s `kind` IS its group name), so this is safe to call ' +
+      'even when flows already reference the util -- unlike delete_util/delete_page_object, this DOES ' +
+      'cascade. Pass groupName: "custom-utils" (or omit it) to move a util back to the default group.',
+    inputSchema: { ...projectArg, name: z.string(), groupName: z.string().optional() },
+  },
+  safe(async ({ project, name, groupName }) => jsonResult(await (await resolveCore(project)).setUtilGroupName(name, groupName)))
+);
+
+server.registerTool(
+  'delete_util_group',
+  {
+    description:
+      'Delete a util group. Does NOT destroy its member utils -- each is moved to "custom-utils" instead ' +
+      '(their params/body are fully meaningful standalone, so this never silently discards content). ' +
+      'Cascades every affected step\'s own `kind` the same way set_util_group_name does.',
+    inputSchema: { ...projectArg, name: z.string() },
+  },
+  safe(async ({ project, name }) => {
+    await (await resolveCore(project)).deleteUtilGroup(name);
+    return textResult(`Deleted util group "${name}" (members moved to "custom-utils").`);
   })
 );
 
