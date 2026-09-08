@@ -153,7 +153,7 @@ function safe(handler) {
   };
 }
 
-const server = new McpServer({ name: 'playwright-easy-spec', version: '1.1.4' });
+const server = new McpServer({ name: 'playwright-easy-spec', version: '1.1.5' });
 
 // ---------- inspection ----------
 
@@ -695,6 +695,23 @@ server.registerTool(
 );
 
 server.registerTool(
+  'set_scenario_meta',
+  {
+    description: 'Update a scenario\'s name, folder, description, preconditions, and/or notes.',
+    inputSchema: {
+      ...projectArg,
+      scenarioId: z.string(),
+      name: z.string().optional(),
+      folder: z.string().optional(),
+      description: z.string().optional(),
+      preconditions: z.string().optional(),
+      notes: z.string().optional(),
+    },
+  },
+  safe(async ({ project, scenarioId, ...patch }) => jsonResult(await (await resolveCore(project)).setScenarioMeta(scenarioId, patch)))
+);
+
+server.registerTool(
   'add_flow_to_scenario',
   {
     description:
@@ -763,14 +780,17 @@ server.registerTool(
 );
 
 // ---------- suites (virtual, multi-membership groupings over existing scenarios -- the Suites tab) ----------
-// A suite entry is a PLACEMENT, never a copy of the scenario: { id, path, scenarioId }. The same
-// scenarioId can have any number of entries, each at its own path -- that's what lets one scenario
-// belong to e.g. both "regression/checkout" and "smoke" at once. Deleting an entry only removes
-// that placement, never the underlying scenario.
+// A suite entry is a PLACEMENT, never a copy of the scenario: { id, path, scenarioId, label? }. The
+// same scenarioId can have any number of entries, each at its own path -- that's what lets one
+// scenario belong to e.g. both "regression/checkout" and "smoke" at once. Deleting an entry only
+// removes that placement, never the underlying scenario. `label` is a free-form external-id string
+// (e.g. a case id from whatever test-management system this project's suite mirrors) that lives on
+// the PLACEMENT, not the scenario -- several entries pointing at the same shared scenario (e.g. a
+// common "login" scenario reused by several external cases) can each carry their own distinct label.
 
 server.registerTool(
   'list_suites',
-  { description: 'List every suite entry in a project: id, folder path, which scenario it points at (plus that scenario\'s own name, for convenience), and its own saved run params (datasetTokens/useYaml/yaml, same shape add_flow_to_scenario stores -- absent means the scenario\'s own default dataset). A suite entry is a SAVED RUN, not a bare reference -- the same scenarioId can appear more than once, at different paths or even the same one, each with its own independent params.', inputSchema: projectArg },
+  { description: 'List every suite entry in a project: id, folder path, which scenario it points at (plus that scenario\'s own name, for convenience), its own external-id `label` if one is set, and its own saved run params (datasetTokens/useYaml/yaml, same shape add_flow_to_scenario stores -- absent means the scenario\'s own default dataset). A suite entry is a SAVED RUN, not a bare reference -- the same scenarioId can appear more than once, at different paths or even the same one, each with its own independent params and label.', inputSchema: projectArg },
   safe(async ({ project }) => {
     const core = await resolveCore(project);
     const [entries, scenarioIds] = await Promise.all([core.loadSuites(), core.listScenarioIds()]);
@@ -778,7 +798,7 @@ server.registerTool(
     for (const id of scenarioIds) names[id] = (await core.loadScenario(id)).name;
     return jsonResult(entries.map((e) => ({
       id: e.id, path: e.path, scenarioId: e.scenarioId, scenarioName: names[e.scenarioId] || '(missing scenario)',
-      datasetTokens: e.datasetTokens, useYaml: e.useYaml, yaml: e.yaml,
+      label: e.label, datasetTokens: e.datasetTokens, useYaml: e.useYaml, yaml: e.yaml,
     })));
   })
 );
@@ -791,17 +811,29 @@ server.registerTool(
       'the root) as a SAVED RUN, not a bare reference -- `datasetTokens`/`useYaml`/`yaml` are the ' +
       'exact same run-config fields add_flow_to_scenario stores (a comma/space-separated list of ' +
       'this scenario\'s own dataset indices/names, or `useYaml`+`yaml` as a raw literal-value ' +
-      'fallback; omit all three to use the scenario\'s own default dataset). Adds a NEW placement -- ' +
-      'calling this again for the same scenarioId (same path or a different one, same params or ' +
-      'different) places it again, it does not move or merge with an existing entry.',
+      'fallback; omit all three to use the scenario\'s own default dataset). `label` is an optional ' +
+      'free-form external-id string for this placement (e.g. a case id from another test-management ' +
+      'system) -- independent of the scenario\'s own name; see set_suite_entry_label to change it ' +
+      'later. Adds a NEW placement -- calling this again for the same scenarioId (same path or a ' +
+      'different one, same params or different) places it again, it does not move or merge with an ' +
+      'existing entry.',
     inputSchema: {
-      ...projectArg, scenarioId: z.string(), path: z.string().optional(),
+      ...projectArg, scenarioId: z.string(), path: z.string().optional(), label: z.string().optional(),
       datasetTokens: z.string().optional(), useYaml: z.boolean().optional(), yaml: z.string().optional(),
     },
   },
-  safe(async ({ project, scenarioId, path, datasetTokens, useYaml, yaml }) =>
-    jsonResult(await (await resolveCore(project)).addSuiteEntry(path || '', scenarioId, { datasetTokens, useYaml, yaml }))
+  safe(async ({ project, scenarioId, path, label, datasetTokens, useYaml, yaml }) =>
+    jsonResult(await (await resolveCore(project)).addSuiteEntry(path || '', scenarioId, { label, datasetTokens, useYaml, yaml }))
   )
+);
+
+server.registerTool(
+  'set_suite_entry_label',
+  { description: 'Set (or clear, by omitting/blanking `label`) one suite placement\'s own free-form external-id label (see list_suites/add_to_suite) -- independent of the scenario\'s own name.', inputSchema: { ...projectArg, entryId: z.string(), label: z.string().optional() } },
+  safe(async ({ project, entryId, label }) => {
+    await (await resolveCore(project)).setSuiteEntryLabel(entryId, label);
+    return textResult(label ? `Set suite entry "${entryId}" label to "${label}".` : `Cleared suite entry "${entryId}" label.`);
+  })
 );
 
 server.registerTool(
