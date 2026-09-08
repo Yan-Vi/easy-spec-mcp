@@ -153,7 +153,7 @@ function safe(handler) {
   };
 }
 
-const server = new McpServer({ name: 'playwright-easy-spec', version: '1.1.5' });
+const server = new McpServer({ name: 'playwright-easy-spec', version: '1.1.6' });
 
 // ---------- inspection ----------
 
@@ -762,6 +762,68 @@ server.registerTool(
   'remove_flow_from_scenario',
   { description: 'Remove one of a scenario\'s composed flows by its index.', inputSchema: { ...projectArg, scenarioId: z.string(), index: z.number() } },
   safe(async ({ project, scenarioId, index }) => jsonResult(await (await resolveCore(project)).removeFlowFromScenario(scenarioId, index)))
+);
+
+// A scenario's own composed sequence is the SAME recursive step-tree shape a flow's `steps` is
+// (see stepSchema above): a "leaf" entry (no `kind`) is a compose-flow/compose-scenario run config
+// -- the exact fields add_flow_to_scenario has always accepted (flowId/scenarioId/datasetTokens/
+// postprocess/useYaml/yaml), just as one object instead of flowId-as-its-own-argument. A
+// `conditional`/`repeat`/`iterate` entry nests further entries (leaves or more control flow) in its
+// own `steps`, letting a scenario branch on or loop over WHICH flows/datasets it composes -- not
+// just name one target per entry. Existing scenarios need no migration: every entry they already
+// have is a valid leaf under this same model, and add_flow_to_scenario/remove_flow_from_scenario
+// keep working unchanged for simple top-level appends.
+//
+// Scope: this only affects LIVE execution (live_replay_scenario/live_start_scenario_run) -- there is
+// no static .spec.ts generation story yet for control-flow scenario entries, and a nested entry's
+// resolved data/output isn't given the stable, codegen-compatible variable name a top-level entry's
+// is (see live-replay.js's own runScenarioControlFlowEntry comment).
+const scenarioStepSchema = z.object({}).passthrough().describe(
+  'A scenario entry: EITHER a leaf run config -- { flowId?, scenarioId? (compose another scenario ' +
+  'instead of a flow -- exactly one of the two), datasetTokens?, postprocess?, useYaml?, yaml? }, the ' +
+  'same fields add_flow_to_scenario takes -- OR a control-flow wrapper -- { kind: "conditional", ' +
+  'condition, steps } | { kind: "iterate", iterableName, itemVarName?, steps } | { kind: "repeat", ' +
+  'init, condition, update, steps }, same semantics as the matching flow-step kind (condition/' +
+  'iterableName/init/update are JS expressions evaluated against this scenario\'s own live context: ' +
+  'globals, its own dataset fields, and any earlier entry\'s captured data/output). `steps` in a ' +
+  'wrapper is itself an array of scenario entries (leaves or more wrappers, nestable arbitrarily). ' +
+  'See get_scenario on an existing scenario for real examples.'
+);
+
+server.registerTool(
+  'add_scenario_step',
+  {
+    description:
+      'Add an entry to a scenario\'s composed sequence, at the end by default. Use parentPath to insert ' +
+      'into a conditional/repeat/iterate entry\'s own nested `steps` -- same placement rules as add_step, ' +
+      'one level up. A leaf entry\'s `flowId`/`scenarioId`/`datasetTokens`/`postprocess`/`useYaml`/`yaml` ' +
+      'fields are identical to add_flow_to_scenario\'s; prefer that tool for the common case (a plain ' +
+      'top-level compose-flow entry) and use this one specifically to author or insert into ' +
+      'conditional/repeat/iterate wrappers.',
+    inputSchema: { ...projectArg, scenarioId: z.string(), step: scenarioStepSchema, at: z.number().optional(), parentPath: z.string().optional() },
+  },
+  safe(async ({ project, scenarioId, step, at, parentPath }) => {
+    const { index } = await (await resolveCore(project)).addScenarioStep(scenarioId, step, { at, parentPath });
+    return textResult(`Added scenario entry at index ${index}.`);
+  })
+);
+
+server.registerTool(
+  'update_scenario_step',
+  {
+    description: 'Patch fields on an existing scenario entry. `stepPath` is dot-separated indices into nested `steps` arrays, e.g. "2.0" is the 1st entry inside the 3rd top-level entry\'s own body -- mirrors update_step one level up.',
+    inputSchema: { ...projectArg, scenarioId: z.string(), stepPath: z.string(), patch: scenarioStepSchema },
+  },
+  safe(async ({ project, scenarioId, stepPath, patch }) => jsonResult(await (await resolveCore(project)).updateScenarioStep(scenarioId, stepPath, patch)))
+);
+
+server.registerTool(
+  'remove_scenario_step',
+  {
+    description: 'Remove a scenario entry by its path (dot-separated indices into nested `steps` arrays -- mirrors remove_step one level up). For a simple top-level entry, remove_flow_from_scenario\'s plain numeric index also still works.',
+    inputSchema: { ...projectArg, scenarioId: z.string(), stepPath: z.string() },
+  },
+  safe(async ({ project, scenarioId, stepPath }) => jsonResult(await (await resolveCore(project)).removeScenarioStep(scenarioId, stepPath)))
 );
 
 server.registerTool(
