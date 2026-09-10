@@ -63,7 +63,7 @@ function buildBridgeApi(wss, port) {
     // below -- so this bridge has nothing meaningful to leak even if connectedSessions() is read by
     // a caller who was never told anything by a human. The only way a real session name ever
     // reaches an MCP client is a human copy/pasting it into connect_panel -- never a tool result.
-    const client = { ws, projectName: null, connectionId: crypto.randomBytes(4).toString('hex') };
+    const client = { ws, projectName: null, connectionId: crypto.randomBytes(4).toString('hex'), displayName: null };
     // Sent unprompted, before anything else -- gives the panel's approval UI a friendly name (and
     // this agent's real uptime, not just "since this particular reconnect") to show right away,
     // independent of (and not gated by) approval itself. No sessionName claim on this first
@@ -88,6 +88,13 @@ function buildBridgeApi(wss, port) {
         // it) -- see this client's own connectionId comment above.
         client.projectName = msg.projectName || null;
         sidepanels.add(client);
+      } else if (msg.type === 'panelName') {
+        // Sent by the panel only once THIS specific connection is already trusted (see
+        // sidepanel.js's approveBridgeConnection) -- a friendly, digit-less label, never the
+        // panel's actual SESSION_NAME secret (see this client's own connectionId comment above for
+        // why that never reaches this process). Purely a display convenience for live_status;
+        // connectionId remains the only thing any live_* tool actually targets with.
+        client.displayName = msg.name || null;
       } else if (msg.type === 'cliNotify') {
         for (const target of findPanelsFor(msg.project)) {
           target.ws.send(JSON.stringify({ type: 'projectChanged', category: msg.category, id: msg.id }));
@@ -156,11 +163,13 @@ function buildBridgeApi(wss, port) {
 
   // Richer sibling of connectedProjectNames -- for live_status (mcp/server.js), so a caller with
   // several panels/windows open on the same project can disambiguate (see sendRequest's own >1
-  // guard above). Exposes each connection's OPAQUE connectionId only -- never anything the panel
-  // itself considers secret (it never told this bridge anything secret to begin with -- see this
-  // client's own connectionId comment in the 'connection' handler above).
+  // guard above). connectionId is the only thing any live_* tool actually targets with; displayName
+  // is a friendly, digit-less label (see the 'panelName' handler above) -- null until that
+  // connection has actually earned trust on the panel's own side, since that's the only point the
+  // panel ever sends it. Still never anything the panel considers secret -- see this client's own
+  // connectionId comment in the 'connection' handler above.
   function connectedSessions() {
-    return [...sidepanels].map((c) => ({ projectName: c.projectName, connectionId: c.connectionId }));
+    return [...sidepanels].map((c) => ({ projectName: c.projectName, connectionId: c.connectionId, displayName: c.displayName }));
   }
 
   // How an MCP tool call (connect_panel, mcp/server.js) claims trust: re-sends 'serverHello' to

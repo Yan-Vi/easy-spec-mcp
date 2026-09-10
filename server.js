@@ -165,7 +165,7 @@ function safe(handler) {
   };
 }
 
-const server = new McpServer({ name: 'playwright-easy-spec', version: '1.2.0' });
+const server = new McpServer({ name: 'playwright-easy-spec', version: '1.3.0' });
 
 // ---------- inspection ----------
 
@@ -960,8 +960,12 @@ server.registerTool(
       'on its own, and NOT the panel\'s own secret session name -- that value never travels from a panel ' +
       'to this server in any form) -- only relevant once more than one panel is connected at once; pass ' +
       'one as `session` on another live_* tool to target it specifically instead of hitting the "more than ' +
-      'one side panel connected" ambiguity error. This never reveals a session name you weren\'t already ' +
-      'told directly by the user -- the only way one reaches you at all is the user pasting it into ' +
+      'one side panel connected" ambiguity error. `displayName` is a friendlier, digit-less label for the ' +
+      'same panel (e.g. "chill-badger") -- null until connect_panel has actually succeeded for that ' +
+      'connection, since the panel only sends it once trust is already established; still pass ' +
+      '`connectionId`, not `displayName`, as `session` -- displayName is display-only and isn\'t ' +
+      'guaranteed unique. This never reveals a session name you weren\'t already told directly by the ' +
+      'user -- the only way the FULL secret name ever reaches you at all is the user pasting it into ' +
       'connect_panel themselves.',
     inputSchema: {},
   },
