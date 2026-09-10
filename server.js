@@ -56,6 +56,18 @@ const liveArg = {
   session: z.string().optional().describe('Which connected side panel to target, by its connection id (see live_status) -- only needed when more than one side panel is connected to the same project.'),
 };
 
+// The unified run-input array shared by every replay entrypoint (live flow/scenario tools, and a
+// scenario/suite entry's own saved run config): each item is independently a dataset name/index on
+// the target's own saved data, a `${var.NAME}`/`${env.NAME}` reference to a global variable/env
+// value (which must itself be an object), or a literal params object -- freely mixed in one list.
+// Omitted = one run against the target's own default dataset (or empty params if it has none, same
+// as a bare click always ran before this field existed). `[]` = zero runs. Naming more than one
+// item runs the target that many times in sequence.
+const dataFieldSchema = z.array(z.union([z.string(), z.record(z.string(), z.any())])).optional()
+  .describe('Run input: a list of dataset names/indices, ${var.X}/${env.X} references, and/or literal '
+    + 'params objects, freely mixed. Omitted = one run against the default dataset. [] = zero runs. '
+    + 'More than one item = that many runs in sequence.');
+
 function soleConnectedName() {
   const names = bridge.connectedProjectNames();
   return names.length === 1 ? names[0] : null;
@@ -153,7 +165,7 @@ function safe(handler) {
   };
 }
 
-const server = new McpServer({ name: 'playwright-easy-spec', version: '1.1.6' });
+const server = new McpServer({ name: 'playwright-easy-spec', version: '1.2.0' });
 
 // ---------- inspection ----------
 
@@ -716,45 +728,43 @@ server.registerTool(
   {
     description:
       'Append a flow OR another already-saved scenario to a scenario\'s composed sequence, as a ' +
-      'RUN CONFIG -- the exact same dataset-tokens/raw-YAML pair live_replay_flow\'s own ' +
-      '`dataset`/`params` resolve, not a per-field override map. Pass exactly one of `flowId` ' +
-      '(the common case) or `composeScenarioId` (compose another scenario instead -- both are ' +
-      'plain functions now, so calling one from another is no different from calling a flow; ' +
-      'rejected if it would create a composition cycle, directly or transitively). ' +
-      '`datasetTokens` is a comma/space-separated list of the target\'s own dataset indices/names ' +
-      '(blank = its first/default dataset); naming more than one makes this ONE entry run its ' +
-      'target multiple times in sequence, right here in the scenario. `useYaml`+`yaml` is the raw ' +
-      'fallback for a one-off value not worth saving as a named dataset -- a YAML/JSON object (one ' +
-      'run), or a list of objects (one run per entry), each used as the target\'s own params ' +
-      'directly (`yaml` is ignored unless `useYaml` is also true). `postprocess` is an expression ' +
-      'evaluated over EACH resolved run\'s own params object right before it fires, receiving ' +
-      '`params` (that run\'s own object) plus every other name already in scope (global variables, ' +
-      'this scenario\'s own dataset fields, and any EARLIER entry\'s own captured output) -- ' +
-      'expected to return the (possibly modified) whole params object; only meaningful for ' +
-      'live_replay_scenario/live_start_scenario_run, evaluated in the connected tab\'s own page ' +
-      'context. Output capture is automatic, not an opt-in field here, and only ever applies to a ' +
-      'FLOW target: when it declares output fields (set_output_field) and populates its own `out` ' +
-      'object via a setVariable step, that output becomes a scenario-scoped variable every LATER ' +
-      'entry can reference by name -- `<camelCase flow name>Output` (a numeric suffix added only ' +
-      'if this scenario references the same flow more than once), holding a single value normally, ' +
-      'or an array of every run\'s own output if this entry resolved to more than one run. A ' +
-      'composed-scenario entry never captures output -- scenarios don\'t declare an output shape.',
+      'RUN CONFIG -- the exact same `data` array live_replay_flow\'s own `data` resolves, not a ' +
+      'per-field override map. Pass exactly one of `flowId` (the common case) or ' +
+      '`composeScenarioId` (compose another scenario instead -- both are plain functions now, so ' +
+      'calling one from another is no different from calling a flow; rejected if it would create a ' +
+      'composition cycle, directly or transitively). `data` is a list whose items are each ' +
+      'independently a dataset name/index on the target\'s own saved data, a `${var.NAME}`/' +
+      '`${env.NAME}` reference (must resolve to an object), or a literal params object -- freely ' +
+      'mixed, `[]` for zero runs, omitted for one run against the target\'s own default dataset. ' +
+      'Naming more than one item makes this ONE entry run its target multiple times in sequence, ' +
+      'right here in the scenario. `postprocess` is an expression evaluated over EACH resolved ' +
+      'run\'s own params object right before it fires, receiving `params` (that run\'s own object) ' +
+      'plus every other name already in scope (global variables, this scenario\'s own dataset ' +
+      'fields, and any EARLIER entry\'s own captured data/output) -- expected to return the ' +
+      '(possibly modified) whole params object; only meaningful for live_replay_scenario/' +
+      'live_start_scenario_run, evaluated in the connected tab\'s own page context. Output capture ' +
+      'is automatic, not an opt-in field here, and only ever applies to a FLOW target: when it ' +
+      'declares output fields (set_output_field) and populates its own `out` object via a ' +
+      'setVariable step, that output becomes a scenario-scoped variable every LATER entry can ' +
+      'reference by name -- `step<N>Output` (1-based, N = this entry\'s own position in the ' +
+      'composed sequence -- positional, not derived from the target\'s name, so reordering never ' +
+      'collides or silently rebinds an existing reference), holding a single value normally, or an ' +
+      'array of every run\'s own output if this entry resolved to more than one run. A composed-' +
+      'scenario entry never captures output -- scenarios don\'t declare an output shape.',
     inputSchema: {
       ...projectArg,
       scenarioId: z.string(),
       flowId: z.string().optional(),
       composeScenarioId: z.string().optional(),
-      datasetTokens: z.string().optional(),
-      useYaml: z.boolean().optional(),
-      yaml: z.string().optional(),
+      data: dataFieldSchema,
       postprocess: z.string().optional(),
     },
   },
-  safe(async ({ project, scenarioId, flowId, composeScenarioId, datasetTokens, useYaml, yaml, postprocess }) => {
+  safe(async ({ project, scenarioId, flowId, composeScenarioId, data, postprocess }) => {
     if (!flowId === !composeScenarioId) {
       throw new Error('Pass exactly one of `flowId` or `composeScenarioId`.');
     }
-    return jsonResult(await (await resolveCore(project)).addFlowToScenario(scenarioId, flowId, { scenarioId: composeScenarioId, datasetTokens, useYaml, yaml, postprocess }));
+    return jsonResult(await (await resolveCore(project)).addFlowToScenario(scenarioId, flowId, { scenarioId: composeScenarioId, data, postprocess }));
   })
 );
 
@@ -766,12 +776,13 @@ server.registerTool(
 
 // A scenario's own composed sequence is the SAME recursive step-tree shape a flow's `steps` is
 // (see stepSchema above): a "leaf" entry (no `kind`) is a compose-flow/compose-scenario run config
-// -- the exact fields add_flow_to_scenario has always accepted (flowId/scenarioId/datasetTokens/
-// postprocess/useYaml/yaml), just as one object instead of flowId-as-its-own-argument. A
-// `conditional`/`repeat`/`iterate` entry nests further entries (leaves or more control flow) in its
-// own `steps`, letting a scenario branch on or loop over WHICH flows/datasets it composes -- not
-// just name one target per entry. Existing scenarios need no migration: every entry they already
-// have is a valid leaf under this same model, and add_flow_to_scenario/remove_flow_from_scenario
+// -- the exact fields add_flow_to_scenario has always accepted (flowId/scenarioId/data/
+// postprocess), just as one object instead of flowId-as-its-own-argument. A `conditional`/
+// `repeat`/`iterate` entry nests further entries (leaves or more control flow) in its own `steps`,
+// letting a scenario branch on or loop over WHICH flows/datasets it composes -- not just name one
+// target per entry. A scenario saved before `data` existed (still carrying `datasetTokens`/
+// `useYaml`/`yaml`) is migrated to `data` on load (see Codegen.migrateScenario); the file on disk
+// isn't rewritten until the scenario is next saved. add_flow_to_scenario/remove_flow_from_scenario
 // keep working unchanged for simple top-level appends.
 //
 // Scope: this only affects LIVE execution (live_replay_scenario/live_start_scenario_run) -- there is
@@ -780,8 +791,8 @@ server.registerTool(
 // is (see live-replay.js's own runScenarioControlFlowEntry comment).
 const scenarioStepSchema = z.object({}).passthrough().describe(
   'A scenario entry: EITHER a leaf run config -- { flowId?, scenarioId? (compose another scenario ' +
-  'instead of a flow -- exactly one of the two), datasetTokens?, postprocess?, useYaml?, yaml? }, the ' +
-  'same fields add_flow_to_scenario takes -- OR a control-flow wrapper -- { kind: "conditional", ' +
+  'instead of a flow -- exactly one of the two), data?, postprocess? }, the same fields ' +
+  'add_flow_to_scenario takes -- OR a control-flow wrapper -- { kind: "conditional", ' +
   'condition, steps } | { kind: "iterate", iterableName, itemVarName?, steps } | { kind: "repeat", ' +
   'init, condition, update, steps }, same semantics as the matching flow-step kind (condition/' +
   'iterableName/init/update are JS expressions evaluated against this scenario\'s own live context: ' +
@@ -796,8 +807,8 @@ server.registerTool(
     description:
       'Add an entry to a scenario\'s composed sequence, at the end by default. Use parentPath to insert ' +
       'into a conditional/repeat/iterate entry\'s own nested `steps` -- same placement rules as add_step, ' +
-      'one level up. A leaf entry\'s `flowId`/`scenarioId`/`datasetTokens`/`postprocess`/`useYaml`/`yaml` ' +
-      'fields are identical to add_flow_to_scenario\'s; prefer that tool for the common case (a plain ' +
+      'one level up. A leaf entry\'s `flowId`/`scenarioId`/`data`/`postprocess` fields are identical ' +
+      'to add_flow_to_scenario\'s; prefer that tool for the common case (a plain ' +
       'top-level compose-flow entry) and use this one specifically to author or insert into ' +
       'conditional/repeat/iterate wrappers.',
     inputSchema: { ...projectArg, scenarioId: z.string(), step: scenarioStepSchema, at: z.number().optional(), parentPath: z.string().optional() },
@@ -852,7 +863,7 @@ server.registerTool(
 
 server.registerTool(
   'list_suites',
-  { description: 'List every suite entry in a project: id, folder path, which scenario it points at (plus that scenario\'s own name, for convenience), its own external-id `label` if one is set, and its own saved run params (datasetTokens/useYaml/yaml, same shape add_flow_to_scenario stores -- absent means the scenario\'s own default dataset). A suite entry is a SAVED RUN, not a bare reference -- the same scenarioId can appear more than once, at different paths or even the same one, each with its own independent params and label.', inputSchema: projectArg },
+  { description: 'List every suite entry in a project: id, folder path, which scenario it points at (plus that scenario\'s own name, for convenience), its own external-id `label` if one is set, and its own saved run params (`data`, same shape add_flow_to_scenario stores -- absent means the scenario\'s own default dataset). A suite entry is a SAVED RUN, not a bare reference -- the same scenarioId can appear more than once, at different paths or even the same one, each with its own independent params and label.', inputSchema: projectArg },
   safe(async ({ project }) => {
     const core = await resolveCore(project);
     const [entries, scenarioIds] = await Promise.all([core.loadSuites(), core.listScenarioIds()]);
@@ -860,7 +871,7 @@ server.registerTool(
     for (const id of scenarioIds) names[id] = (await core.loadScenario(id)).name;
     return jsonResult(entries.map((e) => ({
       id: e.id, path: e.path, scenarioId: e.scenarioId, scenarioName: names[e.scenarioId] || '(missing scenario)',
-      label: e.label, datasetTokens: e.datasetTokens, useYaml: e.useYaml, yaml: e.yaml,
+      label: e.label, data: e.data,
     })));
   })
 );
@@ -870,22 +881,21 @@ server.registerTool(
   {
     description:
       'Place an existing scenario at a suite folder path (e.g. "regression/checkout", or "" for ' +
-      'the root) as a SAVED RUN, not a bare reference -- `datasetTokens`/`useYaml`/`yaml` are the ' +
-      'exact same run-config fields add_flow_to_scenario stores (a comma/space-separated list of ' +
-      'this scenario\'s own dataset indices/names, or `useYaml`+`yaml` as a raw literal-value ' +
-      'fallback; omit all three to use the scenario\'s own default dataset). `label` is an optional ' +
-      'free-form external-id string for this placement (e.g. a case id from another test-management ' +
-      'system) -- independent of the scenario\'s own name; see set_suite_entry_label to change it ' +
-      'later. Adds a NEW placement -- calling this again for the same scenarioId (same path or a ' +
-      'different one, same params or different) places it again, it does not move or merge with an ' +
-      'existing entry.',
+      'the root) as a SAVED RUN, not a bare reference -- `data` is the exact same run-config field ' +
+      'add_flow_to_scenario stores (a list mixing this scenario\'s own dataset names/indices, ' +
+      '${var.X}/${env.X} references, and/or literal objects; omit for the scenario\'s own default ' +
+      'dataset). `label` is an optional free-form external-id string for this placement (e.g. a ' +
+      'case id from another test-management system) -- independent of the scenario\'s own name; ' +
+      'see set_suite_entry_label to change it later. Adds a NEW placement -- calling this again for ' +
+      'the same scenarioId (same path or a different one, same params or different) places it ' +
+      'again, it does not move or merge with an existing entry.',
     inputSchema: {
       ...projectArg, scenarioId: z.string(), path: z.string().optional(), label: z.string().optional(),
-      datasetTokens: z.string().optional(), useYaml: z.boolean().optional(), yaml: z.string().optional(),
+      data: dataFieldSchema,
     },
   },
-  safe(async ({ project, scenarioId, path, label, datasetTokens, useYaml, yaml }) =>
-    jsonResult(await (await resolveCore(project)).addSuiteEntry(path || '', scenarioId, { label, datasetTokens, useYaml, yaml }))
+  safe(async ({ project, scenarioId, path, label, data }) =>
+    jsonResult(await (await resolveCore(project)).addSuiteEntry(path || '', scenarioId, { label, data }))
   )
 );
 
@@ -982,16 +992,17 @@ server.registerTool(
       'Replay a single flow live, in the side panel\'s own connected browser tab (real chrome.debugger, ' +
       'the user\'s real session/login) -- requires the side panel open and connected to this project. ' +
       'Targets whichever tab is pinned in the side panel\'s header, or the browser\'s actual active tab ' +
-      'if none is pinned.',
+      'if none is pinned. To override just one field of a saved dataset rather than replace it '+
+      'entirely, pass a literal object with that dataset\'s fields spread in -- there is no separate ' +
+      'merge-over-a-named-dataset option.',
     inputSchema: {
       ...liveArg,
       flowId: z.string(),
-      params: z.record(z.string(), z.any()).optional(),
-      dataset: z.string().optional().describe('Name of an existing flow-data dataset to use as the base params'),
+      data: dataFieldSchema,
     },
   },
-  safe(async ({ project, session, flowId, params, dataset }) => {
-    const result = await bridge.sendRequest(resolveLiveProject(project, session), 'replay', { flowId, params, dataset }, undefined, session);
+  safe(async ({ project, session, flowId, data }) => {
+    const result = await bridge.sendRequest(resolveLiveProject(project, session), 'replay', { flowId, data }, undefined, session);
     if (!result.ok) throw new Error(result.error || 'Replay failed.');
     return textResult('Replay passed.');
   })
@@ -1005,26 +1016,26 @@ server.registerTool(
       'real tracked Run (shows up in the Runs tab with live per-step status dots, same as ' +
       'live_replay_flow/live_start_run) -- for re-verifying just the steps you just added/changed ' +
       'instead of a full live_replay_flow from step 0 every time. Context is seeded the same way a ' +
-      'fresh replay\'s first iteration would be (the chosen dataset/params -- or the flow\'s own ' +
-      'first/default dataset if neither is given -- plus state-var defaults), since a mid-flow slice ' +
-      'has no prior-steps history to inherit values from otherwise: if the steps in range reference a ' +
-      'param/state-var, pass a `dataset` (or `params`) that actually defines it, or the slice will see ' +
-      'it as undefined even though a full replay from step 0 would have set it correctly by this ' +
-      'point. `results` has one entry per step actually attempted (stops at the first failure, same as ' +
-      'a full replay) with its 0-based index in the flow\'s own step list. Blocks until the slice ' +
-      'finishes (or fails) and moves from the Runs tab\'s current list to its history, same as ' +
-      'live_replay_flow. Requires the side panel open and connected.',
+      'fresh replay\'s first iteration would be (`data`\'s own resolution -- or the flow\'s own ' +
+      'first/default dataset if omitted -- plus state-var defaults), since a mid-flow slice has no ' +
+      'prior-steps history to inherit values from otherwise: if the steps in range reference a ' +
+      'param/state-var, pass a `data` item that actually defines it, or the slice will see it as ' +
+      'undefined even though a full replay from step 0 would have set it correctly by this point. ' +
+      'Naming more than one `data` item re-runs the same slice once per item. `results` has one entry ' +
+      'per step actually attempted (stops at the first failure, same as a full replay) with its ' +
+      '0-based index in the flow\'s own step list. Blocks until the slice finishes (or fails) and ' +
+      'moves from the Runs tab\'s current list to its history, same as live_replay_flow. Requires the ' +
+      'side panel open and connected.',
     inputSchema: {
       ...liveArg,
       flowId: z.string(),
       from: z.number().describe('First step index to run (0-based, inclusive)'),
       to: z.number().describe('Last step index to run (0-based, inclusive)'),
-      params: z.record(z.string(), z.any()).optional(),
-      dataset: z.string().optional().describe('Name of an existing flow-data dataset to use as the base params'),
+      data: dataFieldSchema,
     },
   },
-  safe(async ({ project, session, flowId, from, to, params, dataset }) => {
-    const result = await bridge.sendRequest(resolveLiveProject(project, session), 'runStepRange', { flowId, from, to, params, dataset }, undefined, session);
+  safe(async ({ project, session, flowId, from, to, data }) => {
+    const result = await bridge.sendRequest(resolveLiveProject(project, session), 'runStepRange', { flowId, from, to, data }, undefined, session);
     if (!result.ok && !result.results) throw new Error(result.error || 'Run failed.');
     return jsonResult({ ok: result.ok, results: result.results, runId: result.runId, name: result.name });
   })
@@ -1147,12 +1158,11 @@ server.registerTool(
     inputSchema: {
       ...liveArg,
       flowId: z.string(),
-      params: z.record(z.string(), z.any()).optional(),
-      dataset: z.string().optional().describe('Name of an existing flow-data dataset to use as the base params'),
+      data: dataFieldSchema,
     },
   },
-  safe(async ({ project, session, flowId, params, dataset }) => {
-    const result = await bridge.sendRequest(resolveLiveProject(project, session), 'startRun', { flowId, params, dataset }, undefined, session);
+  safe(async ({ project, session, flowId, data }) => {
+    const result = await bridge.sendRequest(resolveLiveProject(project, session), 'startRun', { flowId, data }, undefined, session);
     if (!result.ok) throw new Error(result.error || 'Failed to start run.');
     return jsonResult({ runId: result.runId, name: result.name, tabId: result.tabId });
   })
@@ -1218,17 +1228,19 @@ server.registerTool(
       'stopping at the first flow that fails, exactly like a single flow stops at its first failing ' +
       'step. A flow entry whose flow declares output (see add_flow_to_scenario) automatically has ' +
       'its captured `out` bound to a name every LATER entry\'s own expression-mode params/postprocess ' +
-      'can reference. Requires the side panel open and connected. Targets whichever tab is pinned in the ' +
-      'side panel\'s header, or the browser\'s actual active tab if none is pinned.',
+      'can reference. Naming more than one `data` item runs the whole scenario that many times in ' +
+      'sequence (same run, same runId -- see live_get_scenario_run), stopping at the first run that ' +
+      'fails, same as a single flow\'s own multi-run replay. Requires the side panel open and ' +
+      'connected. Targets whichever tab is pinned in the side panel\'s header, or the browser\'s ' +
+      'actual active tab if none is pinned.',
     inputSchema: {
       ...liveArg,
       scenarioId: z.string(),
-      params: z.record(z.string(), z.any()).optional(),
-      dataset: z.string().optional().describe('Name of an existing scenario-data dataset to use as the base scenario params'),
+      data: dataFieldSchema,
     },
   },
-  safe(async ({ project, session, scenarioId, params, dataset }) => {
-    const result = await bridge.sendRequest(resolveLiveProject(project, session), 'replayScenario', { scenarioId, params, dataset }, undefined, session);
+  safe(async ({ project, session, scenarioId, data }) => {
+    const result = await bridge.sendRequest(resolveLiveProject(project, session), 'replayScenario', { scenarioId, data }, undefined, session);
     if (!result.ok) throw new Error(result.error || 'Scenario replay failed.');
     return textResult('Scenario replay passed.');
   })
@@ -1246,12 +1258,11 @@ server.registerTool(
     inputSchema: {
       ...liveArg,
       scenarioId: z.string(),
-      params: z.record(z.string(), z.any()).optional(),
-      dataset: z.string().optional().describe('Name of an existing scenario-data dataset to use as the base scenario params'),
+      data: dataFieldSchema,
     },
   },
-  safe(async ({ project, session, scenarioId, params, dataset }) => {
-    const result = await bridge.sendRequest(resolveLiveProject(project, session), 'startScenarioRun', { scenarioId, params, dataset }, undefined, session);
+  safe(async ({ project, session, scenarioId, data }) => {
+    const result = await bridge.sendRequest(resolveLiveProject(project, session), 'startScenarioRun', { scenarioId, data }, undefined, session);
     if (!result.ok) throw new Error(result.error || 'Failed to start scenario run.');
     return jsonResult({ runId: result.runId, name: result.name, tabId: result.tabId });
   })
