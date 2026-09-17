@@ -165,7 +165,7 @@ function safe(handler) {
   };
 }
 
-const server = new McpServer({ name: 'playwright-easy-spec', version: '1.3.0' });
+const server = new McpServer({ name: 'playwright-easy-spec', version: '1.4.0' });
 
 // ---------- inspection ----------
 
@@ -208,7 +208,7 @@ server.registerTool(
     const out = [];
     for (const name of names) {
       const po = await core.loadPageObject(name);
-      out.push({ name, folder: po.folder || '', locators: Object.keys(po.methods || {}).length, scopes: Object.keys(po.scopes || {}).length });
+      out.push({ name, folder: po.folder || '', locators: Object.keys(po.methods || {}).length, scopes: Object.keys(po.scopes || {}).length, utils: Object.keys(po.utils || {}).length });
     }
     return jsonResult(out);
   })
@@ -242,7 +242,9 @@ server.registerTool(
       'string on its own. Each shows its inferred parameters (from ${...} inside one of the expression\'s ' +
       'own string-literal arguments, see extractPoParams) alongside the raw expression. A locator with a ' +
       '`scope` field is nested under that named scope (see the scopes map) -- its own expression only needs ' +
-      'to be unique within the scope\'s subtree, not the whole page.',
+      'to be unique within the scope\'s subtree, not the whole page. `utils` are this page object\'s own ' +
+      'scoped util functions (params + body, real code -- see set_page_object_util_body), called from a ' +
+      'step via `{ kind: "page-object-util", pageObjectName, method, args? }` rather than a plain selector.',
     inputSchema: { ...projectArg, name: z.string() },
   },
   safe(async ({ project, name }) => {
@@ -259,7 +261,10 @@ server.registerTool(
     const scopes = Object.fromEntries(
       Object.entries(po.scopes || {}).map(([scopeName, selector]) => [scopeName, { selector, params: extractPoParams(selector).params }])
     );
-    return jsonResult({ name: po.name, folder: po.folder || '', locators, scopes });
+    const utils = Object.fromEntries(
+      Object.entries(po.utils || {}).map(([method, util]) => [method, { params: util.params || [], body: util.body || '', notes: util.notes || '' }])
+    );
+    return jsonResult({ name: po.name, folder: po.folder || '', locators, scopes, utils });
   })
 );
 
@@ -331,7 +336,15 @@ const stepSchema = z.object({}).passthrough().describe(
   'to "custom-utils"; see list_util_groups), and `method` names which function within it, exactly like ' +
   'kind:"context"+method:"clearCookies" -- e.g. { kind: "custom-utils", method: "connectDb", args?, ' +
   'variable? }. Look up a util\'s current groupName via get_util/list_utils before authoring a step that ' +
-  'calls it.'
+  'calls it. `kind: "page-object-util"` is the PAGE-OBJECT-SCOPED counterpart of a group util -- for ' +
+  'logic that conceptually belongs to one specific page object (e.g. disambiguating one of several ' +
+  'same-shaped controls on that page by nearby text) rather than being a project-wide shared function. ' +
+  'Its own `pageObjectName` names which page object owns it (see set_page_object_util_body/' +
+  'set_page_object_util_params), `method` names the util within that page object -- e.g. ' +
+  '{ kind: "page-object-util", pageObjectName: "ChartCommon", method: "answerYesNo", args?, variable? }. ' +
+  'Unlike a plain `locator`-kind step bound to a page object (pageObjectName+pageObjectMethod, a bare ' +
+  'selector), this runs a real function body with page/context access, same as a group util\'s body -- ' +
+  'reach for it only when the action genuinely cannot be expressed as a single selector-based call.'
 );
 
 server.registerTool(
@@ -533,6 +546,49 @@ server.registerTool(
   safe(async ({ project, pageObject, method, scope }) => {
     await (await resolveCore(project)).setMethodScope(pageObject, method, scope || null);
     return textResult(scope ? `Nested locator "${method}" under scope "${scope}".` : `Unassigned locator "${method}"'s scope.`);
+  })
+);
+
+// ---------- page object utils (a page-object-SCOPED counterpart of a project-wide util -- see
+// add_step's own stepSchema doc for the `kind: "page-object-util"` shape). Lives on the page object
+// itself, not a group -- there's nothing else to move it between the way a group util can be
+// reassigned with set_util_group_name. ----------
+
+server.registerTool(
+  'set_page_object_util_body',
+  {
+    description:
+      'Set a page-object-scoped util\'s body -- plain TypeScript statements, no wrapping `async ' +
+      '(...) { }` (generated automatically from this body + the util\'s own params, see ' +
+      'set_page_object_util_params). Creates the util on first use if `method` doesn\'t exist yet on this ' +
+      'page object. A step calls it via `{ kind: "page-object-util", pageObjectName, method, args?, ' +
+      'variable? }` (see add_step) -- like a group util\'s body, it runs with real `page`/`context` access, ' +
+      'scoped to exactly this util\'s own declared params, not a flow\'s whole context. Use this (rather ' +
+      'than a project-wide util, see set_util_body) when the logic conceptually belongs to one specific ' +
+      'page object -- e.g. disambiguating one of several same-shaped controls on that page by nearby text.',
+    inputSchema: { ...projectArg, pageObject: z.string(), method: z.string(), body: z.string() },
+  },
+  safe(async ({ project, pageObject, method, body }) => jsonResult(await (await resolveCore(project)).setPageObjectUtilBody(pageObject, method, body)))
+);
+
+server.registerTool(
+  'set_page_object_util_params',
+  {
+    description: 'Set a page-object-scoped util\'s ordered parameter names (bare identifiers, e.g. ["questionSubstr", "answer"]).',
+    inputSchema: { ...projectArg, pageObject: z.string(), method: z.string(), params: z.array(z.string()) },
+  },
+  safe(async ({ project, pageObject, method, params }) => jsonResult(await (await resolveCore(project)).setPageObjectUtilParams(pageObject, method, params)))
+);
+
+server.registerTool(
+  'remove_page_object_util',
+  {
+    description: 'Remove a util from a page object. Fails if any flow step still calls it (kind: "page-object-util") -- remove those steps first.',
+    inputSchema: { ...projectArg, pageObject: z.string(), method: z.string() },
+  },
+  safe(async ({ project, pageObject, method }) => {
+    await (await resolveCore(project)).removePageObjectUtil(pageObject, method);
+    return textResult(`Removed util "${method}" from page object "${pageObject}".`);
   })
 );
 
