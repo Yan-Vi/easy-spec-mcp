@@ -165,7 +165,7 @@ function safe(handler) {
   };
 }
 
-const server = new McpServer({ name: 'playwright-easy-spec', version: '1.4.0' });
+const server = new McpServer({ name: 'playwright-easy-spec', version: '1.4.1' });
 
 // ---------- inspection ----------
 

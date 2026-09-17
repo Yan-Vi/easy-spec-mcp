@@ -1,10 +1,10 @@
 {
   "name": "easy-spec-mcp",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "MCP server for Easy Spec - Playwright: edit flows, scenarios, and page objects, and drive live browser automation, through a connected browser extension side panel.",
   "main": "server.js",
   "bin": {
-    "easy-spec-mcp": "./server.js"
+    "easy-spec-mcp": "server.js"
   },
   "files": [
     "server.js",

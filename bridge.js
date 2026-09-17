@@ -109,7 +109,22 @@ function buildBridgeApi(wss, port) {
         resolve(msg.result);
       }
     });
-    ws.on('close', () => sidepanels.delete(client));
+    ws.on('close', () => {
+      sidepanels.delete(client);
+      // Any request already in flight to THIS exact connection has no way to ever get its
+      // `<type>Result` now -- reject it right away instead of leaving it to sendRequest's own
+      // (up to 10-minute) timeout. A reload/close of the side panel, or the extension itself
+      // going away, closes this socket the same way a network blip would; either way, waiting out
+      // the full timeout for something we already know isn't coming is exactly the kind of "hang"
+      // this bridge should never inflict on a caller (confirmed live: a panel reconnect mid-request
+      // left an MCP tool call waiting with no feedback until this existed).
+      for (const [requestId, entry] of pending) {
+        if (entry.ws !== ws) continue;
+        clearTimeout(entry.timeout);
+        pending.delete(requestId);
+        entry.reject(new Error('The side panel disconnected while this request was in flight.'));
+      }
+    });
   });
 
   // Pushed after every mutating ProjectCore call (see lib/projectCore.js's own notify hook) so a side
@@ -147,13 +162,16 @@ function buildBridgeApi(wss, port) {
       throw new Error(`More than one side panel is connected ${scope} (${ids}) -- pass \`session\` with one of these connection ids to say which one, or close all but one and try again.`);
     }
     const requestId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const targetWs = targets[0].ws;
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         pending.delete(requestId);
         reject(new Error(`Timed out waiting for the side panel to respond to "${requestType}".`));
       }, timeoutMs);
-      pending.set(requestId, { resolve, reject, timeout });
-      targets[0].ws.send(JSON.stringify({ type: requestType, requestId, ...payload }));
+      // ws recorded so a 'close' on this exact connection (see wss.on('connection') above) can
+      // reject this one request right away instead of waiting out the full timeout above.
+      pending.set(requestId, { resolve, reject, timeout, ws: targetWs });
+      targetWs.send(JSON.stringify({ type: requestType, requestId, ...payload }));
     });
   }
 
