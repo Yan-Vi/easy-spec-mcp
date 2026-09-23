@@ -167,6 +167,26 @@ function safe(handler) {
 
 const server = new McpServer({ name: 'playwright-easy-spec', version: '1.4.1' });
 
+// Scenarios and suites are hidden in the side panel UI for now -- keep their MCP tools out of the
+// list too rather than leaving them callable against a feature nobody can see or navigate to.
+// Single point of control so re-enabling later is a one-line revert, not re-touching every call site.
+const DISABLED_TOOLS = new Set([
+  'list_scenarios', 'get_scenario', 'create_scenario', 'delete_scenario', 'set_scenario_meta',
+  'add_flow_to_scenario', 'remove_flow_from_scenario', 'add_scenario_step', 'update_scenario_step',
+  'remove_scenario_step', 'set_scenario_dataset', 'remove_scenario_dataset',
+  'live_replay_scenario', 'live_start_scenario_run', 'live_list_scenario_runs',
+  'live_get_scenario_run', 'live_cancel_scenario_run',
+  'list_suites', 'list_suite_folder_preconditions', 'add_to_suite', 'set_suite_entry_label',
+  'set_suite_entry_precondition', 'set_suite_folder_precondition', 'remove_from_suite', 'move_suite_entry',
+  'live_run_suite', 'live_list_suite_runs', 'live_get_suite_run', 'live_cancel_suite_run',
+]);
+const registerTool = server.registerTool.bind(server);
+server.registerTool = (name, config, cb) => {
+  const tool = registerTool(name, config, cb);
+  if (DISABLED_TOOLS.has(name)) tool.disable();
+  return tool;
+};
+
 // ---------- inspection ----------
 
 server.registerTool(
