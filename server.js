@@ -919,7 +919,7 @@ server.registerTool(
 
 server.registerTool(
   'list_suites',
-  { description: 'List every suite entry in a project: id, folder path, which scenario it points at (plus that scenario\'s own name, for convenience), its own external-id `label` if one is set, and its own saved run params (`data`, same shape add_flow_to_scenario stores -- absent means the scenario\'s own default dataset). A suite entry is a SAVED RUN, not a bare reference -- the same scenarioId can appear more than once, at different paths or even the same one, each with its own independent params and label.', inputSchema: projectArg },
+  { description: 'List every suite entry in a project: id, folder path, which scenario it points at (plus that scenario\'s own name, for convenience), its own external-id `label` if one is set, its own saved run params (`data`, same shape add_flow_to_scenario stores -- absent means the scenario\'s own default dataset), and its own `precondition` if one is set (see set_suite_entry_precondition) -- a second scenario + its own name + its own `data`, run on the same worker tab before every attempt of this entry\'s real scenario. A suite entry is a SAVED RUN, not a bare reference -- the same scenarioId can appear more than once, at different paths or even the same one, each with its own independent params, label, and precondition.', inputSchema: projectArg },
   safe(async ({ project }) => {
     const core = await resolveCore(project);
     const [entries, scenarioIds] = await Promise.all([core.loadSuites(), core.listScenarioIds()]);
@@ -928,6 +928,11 @@ server.registerTool(
     return jsonResult(entries.map((e) => ({
       id: e.id, path: e.path, scenarioId: e.scenarioId, scenarioName: names[e.scenarioId] || '(missing scenario)',
       label: e.label, data: e.data,
+      ...(e.precondition ? { precondition: {
+        scenarioId: e.precondition.scenarioId,
+        scenarioName: names[e.precondition.scenarioId] || '(missing scenario)',
+        data: e.precondition.data,
+      } } : {}),
     })));
   })
 );
@@ -961,6 +966,29 @@ server.registerTool(
   safe(async ({ project, entryId, label }) => {
     await (await resolveCore(project)).setSuiteEntryLabel(entryId, label);
     return textResult(label ? `Set suite entry "${entryId}" label to "${label}".` : `Cleared suite entry "${entryId}" label.`);
+  })
+);
+
+server.registerTool(
+  'set_suite_entry_precondition',
+  {
+    description:
+      'Set (or clear, by omitting `scenarioId`) one suite placement\'s "before each" -- a second ' +
+      'scenario run on the SAME worker tab immediately before every attempt of the entry\'s real ' +
+      'scenario (including retries), so a case with no setup of its own can still assume a valid ' +
+      'starting state (logged in, on the right screen) without composing that setup into the case\'s ' +
+      'own scenario. `data` is the exact same run-config field add_to_suite/add_flow_to_scenario ' +
+      'store, applied to the PRECONDITION scenario, not the entry\'s own -- omit for its own default ' +
+      'dataset. If the precondition\'s own `data` would resolve to more than one run, only the first ' +
+      'is used. A precondition that itself fails counts that attempt as failed without ever starting ' +
+      'the entry\'s real scenario.',
+    inputSchema: { ...projectArg, entryId: z.string(), scenarioId: z.string().optional(), data: dataFieldSchema },
+  },
+  safe(async ({ project, entryId, scenarioId, data }) => {
+    await (await resolveCore(project)).setSuiteEntryPrecondition(entryId, scenarioId ? { scenarioId, data } : null);
+    return textResult(scenarioId
+      ? `Set suite entry "${entryId}" precondition to scenario "${scenarioId}".`
+      : `Cleared suite entry "${entryId}" precondition.`);
   })
 );
 
