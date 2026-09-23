@@ -919,7 +919,20 @@ server.registerTool(
 
 server.registerTool(
   'list_suites',
-  { description: 'List every suite entry in a project: id, folder path, which scenario it points at (plus that scenario\'s own name, for convenience), its own external-id `label` if one is set, its own saved run params (`data`, same shape add_flow_to_scenario stores -- absent means the scenario\'s own default dataset), and its own `precondition` if one is set (see set_suite_entry_precondition) -- a second scenario + its own name + its own `data`, run on the same worker tab before every attempt of this entry\'s real scenario. A suite entry is a SAVED RUN, not a bare reference -- the same scenarioId can appear more than once, at different paths or even the same one, each with its own independent params, label, and precondition.', inputSchema: projectArg },
+  {
+    description:
+      'List every suite entry in a project: id, folder path, which scenario it points at (plus ' +
+      'that scenario\'s own name, for convenience), its own external-id `label` if one is set, its ' +
+      'own saved run params (`data`, same shape add_flow_to_scenario stores -- absent means the ' +
+      'scenario\'s own default dataset), and its own `precondition` if one is set (see ' +
+      'set_suite_entry_precondition) -- a second scenario + its own name + its own `data`, run on ' +
+      'the same worker tab before every attempt of this entry\'s real scenario. A suite entry is a ' +
+      'SAVED RUN, not a bare reference -- the same scenarioId can appear more than once, at ' +
+      'different paths or even the same one, each with its own independent params, label, and ' +
+      'precondition. Folders can carry their own precondition too -- see ' +
+      'list_suite_folder_preconditions, not returned here.',
+    inputSchema: projectArg,
+  },
   safe(async ({ project }) => {
     const core = await resolveCore(project);
     const [entries, scenarioIds] = await Promise.all([core.loadSuites(), core.listScenarioIds()]);
@@ -933,6 +946,29 @@ server.registerTool(
         scenarioName: names[e.precondition.scenarioId] || '(missing scenario)',
         data: e.precondition.data,
       } } : {}),
+    })));
+  })
+);
+
+server.registerTool(
+  'list_suite_folder_preconditions',
+  {
+    description:
+      'List every suite folder path that has its own precondition set (see ' +
+      'set_suite_folder_precondition) -- each with the precondition scenario\'s id and name and its ' +
+      'own saved `data`. \'\' is the suite root: a precondition set there runs before every entry in ' +
+      'the whole suite. An entry actually runs EVERY ancestor folder\'s precondition, root-to-leaf, ' +
+      'then its own (see set_suite_entry_precondition) -- not just the nearest one -- so a case ' +
+      'several folders deep can be affected by more than one row here at once.',
+    inputSchema: projectArg,
+  },
+  safe(async ({ project }) => {
+    const core = await resolveCore(project);
+    const [folderPreconditions, scenarioIds] = await Promise.all([core.loadSuiteFolderPreconditions(), core.listScenarioIds()]);
+    const names = {};
+    for (const id of scenarioIds) names[id] = (await core.loadScenario(id)).name;
+    return jsonResult(Object.entries(folderPreconditions).map(([path, pre]) => ({
+      path, scenarioId: pre.scenarioId, scenarioName: names[pre.scenarioId] || '(missing scenario)', data: pre.data,
     })));
   })
 );
@@ -989,6 +1025,28 @@ server.registerTool(
     return textResult(scenarioId
       ? `Set suite entry "${entryId}" precondition to scenario "${scenarioId}".`
       : `Cleared suite entry "${entryId}" precondition.`);
+  })
+);
+
+server.registerTool(
+  'set_suite_folder_precondition',
+  {
+    description:
+      'Set (or clear, by omitting `scenarioId`) a suite FOLDER\'s own "before each" -- same shape ' +
+      'and same worker-tab/every-attempt treatment as set_suite_entry_precondition, except it ' +
+      'applies to every entry placed anywhere at or under `path` (\'\' = the suite root, so a ' +
+      'precondition set there runs before literally every case in the suite), not just one entry. ' +
+      'Stacks with every OTHER ancestor folder\'s own precondition and the entry\'s own -- an entry ' +
+      'three folders deep runs the root\'s, then each folder\'s on the way down, then its own, in ' +
+      'that order -- rather than only the nearest one applying. `data` applies to the precondition ' +
+      'scenario itself, same as add_to_suite/set_suite_entry_precondition.',
+    inputSchema: { ...projectArg, path: z.string().optional(), scenarioId: z.string().optional(), data: dataFieldSchema },
+  },
+  safe(async ({ project, path, scenarioId, data }) => {
+    await (await resolveCore(project)).setSuiteFolderPrecondition(path || '', scenarioId ? { scenarioId, data } : null);
+    return textResult(scenarioId
+      ? `Set folder "${path || '(suite root)'}" precondition to scenario "${scenarioId}".`
+      : `Cleared folder "${path || '(suite root)'}" precondition.`);
   })
 );
 
